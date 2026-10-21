@@ -1,0 +1,734 @@
+"""图形界面：拖拽或选择文件，一键打包 / 还原。
+
+依赖 tkinter（Python 自带）。若安装了 tkinterdnd2 则支持拖拽，否则退回按钮选择。
+    pip install tkinterdnd2     # 可选，仅用于拖拽
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+from . import container as ct
+from . import codecs as codec_mod
+from . import compress as compress_mod
+from . import crypto as crypto_mod
+
+try:  # 拖拽支持为可选项
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    _HAS_DND = True
+except Exception:  # pragma: no cover
+    _HAS_DND = False
+
+APP_TITLE = "officepack — Office 文档 ↔ 纯文本"
+OFFICE_EXTS = (".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm",
+               ".ppt", ".pptx", ".pptm", ".rtf", ".odt", ".pdf")
+TEXT_EXTS = (".txt", ".opk")
+
+# 每个参数的说明：(标题, 一句话说明, [(选项名, 详细作用)])
+# 显示时会把「当前选中的选项」高亮出来，方便对照
+HELP: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
+    "preset": (
+        "预设",
+        "一键组合「编码器 + 压缩器」。改下面任意一项，预设会自动变成「自定义」。",
+        [
+            ("chars", "汉字编码 + 最强压缩。字符数最少（1 个汉字装 14 bit），适合「每次只能输入少量字」的渠道；"
+                      "代价是 UTF-8 字节数最大，按字节限额的渠道不划算。"),
+            ("compact", "base91 + auto 压缩。ASCII 文本里体积最小，适合按字节计费的渠道（邮件、短信、接口）。"),
+            ("safe", "base32 + auto 压缩。纯大写字母+数字，不会被邮件/IM 改大小写或插转义符，"
+                     "体积比 compact 大约 30%，换来的是「怎么转手都不坏」。"),
+            ("fast", "base64 + zlib。编解码最快，压缩率一般，适合大批量小文件。"),
+            ("plain", "base64 + 不压缩。最透明，肉眼能看出是 base64，适合小文件或需要人工核对。"),
+            ("自定义", "不用预设，完全按下面手动选的编码器 / 压缩器组合。"),
+        ],
+    ),
+    "codec": (
+        "编码器",
+        "把二进制字节映射成可打印字符。数字是「每个原始字节要占几个字符」，越小则字符数越少。",
+        [
+            ("cjk", "0.571 字符/字节 —— 每 14 bit 编成一个常用汉字（U+4E00 起 16384 个），"
+                    "字符数最少，是唯一比原始字节还少的编码。但 UTF-8 一个字占 3 字节，"
+                    "所以「字节数」最大（约 1.71 倍）。按字符限额选它，按字节限额别选。"),
+            ("base91", "1.231 字符/字节 —— 纯 ASCII 里最紧凑，字母表已剔除 - ' \\ 等易被转义或折断的符号。"),
+            ("base85", "1.250 字符/字节 —— 略逊于 base91，且含 \" ' \\，部分渠道粘贴会被转义。"),
+            ("base64", "1.334 字符/字节 —— 最通用，含 + / = 三个符号，某些渠道会把 + 变成空格。"),
+            ("base32", "1.600 字符/字节 —— 纯大写字母+数字，最耐复制粘贴，代价是体积最大。"),
+            ("hex", "2.000 字符/字节 —— 十六进制，最直观可审计，体积是 base91 的 1.6 倍。"),
+            ("custom", "1.334 字符/字节 —— 用自备的 64 个可打印字符做码表（命令行 --alphabet 指定），可做轻度混淆。"),
+        ],
+    ),
+    "compress": (
+        "压缩器",
+        "编码之前先压缩，压得越狠文本越短、速度越慢。顺序固定为「先压缩再加密」。",
+        [
+            ("auto", "推荐。先试 lzma，压不动就自动跳过 —— docx/xlsx/pptx 本身已是 ZIP，"
+                     "再压没有收益，auto 不会让它越压越大。"),
+            ("max", "lzma 试 4 组参数取体积最小的一组，最慢但压得最狠。纯文本、老格式 doc 收益明显。"),
+            ("lzma", "标准 lzma，压缩率高，速度中等，是 auto 实际使用的算法。"),
+            ("zlib", "速度快、兼容性最好，压缩率一般。"),
+            ("bz2", "压缩率介于 zlib 和 lzma 之间，速度也居中。"),
+            ("none", "完全不压。适合本身已压缩的内容（jpg / png / zip），省掉无用计算。"),
+        ],
+    ),
+    "cipher": (
+        "加密器",
+        "压缩之后加密，还原时必须提供同一口令；内容被改动 1 个字符就会校验失败。",
+        [
+            ("none", "不加密。谁拿到文本都能还原，适合内部传阅或不敏感的文档。"),
+            ("aes-256-gcm", "AES-256-GCM 加密 + scrypt 派生密钥，带认证标签：既防偷看也防篡改。"
+                            "必须在下面填口令，口令丢了文件无法恢复。"),
+        ],
+    ),
+    "password": (
+        "口令",
+        "加密用的密码，只在内存里使用，不保存、不上传、不写进产出的文本。",
+        [
+            ("", "选 aes-256-gcm 时必填；选 none 时留空即可。"
+                 "口令区分大小写，建议用「一句话+数字」而不是「123456」。"),
+        ],
+    ),
+    "outdir": (
+        "输出目录",
+        "产出的文件写到哪里。",
+        [
+            ("", "留空时：打包存到「源文件所在目录」；粘贴还原存到「桌面」。"),
+            ("set", "点右侧「…」选文件夹，也可以直接把路径粘进输入框。处理完会弹窗给出完整路径，"
+                    "并可一键打开。"),
+        ],
+    ),
+    "split": (
+        "分片输出",
+        "把一份文本切成若干段，专给「每次只能输入固定字数」的渠道用。默认关闭。",
+        [
+            ("off", "不勾选：整份输出一个文件，最省事。"),
+            ("on", "勾选后按「字/段」切分。每段自带段头（文档ID / 序号 / 总段数 / 校验）与段内字符数，"
+                   "可乱序收集、段尾多粘文字也能自动截断；凑齐后一起还原，或直接粘进「粘贴文本还原」。"),
+        ],
+    ),
+}
+
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return ("%.0f %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024
+    return "%.1f GiB" % n
+
+
+class App:
+    def __init__(self, root: tk.Tk, has_dnd: bool):
+        self.root = root
+        self.has_dnd = has_dnd
+        self.files: list[str] = []
+        self.queue: queue.Queue = queue.Queue()
+        self.worker: threading.Thread | None = None
+        self.last_out_dir: str | None = None   # 上一轮实际写出文件的目录
+
+        root.title(APP_TITLE)
+        root.geometry("980x660")
+        root.minsize(860, 580)
+
+        self._build_style()
+        self._build_ui()
+        self._poll_queue()
+
+    # ---------------- UI ----------------
+    def _build_style(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("vista")
+        except tk.TclError:
+            pass
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 15, "bold"))
+        style.configure("Hint.TLabel", foreground="#666666")
+        style.configure("Go.TButton", font=("Microsoft YaHei UI", 10, "bold"))
+
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", padx=14, pady=(12, 4))
+        ttk.Label(header, text="Office 文档 ↔ 纯文本 无损装换", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="文档 → 文本编码载体（可加密）；还原后与原文件 SHA-256 完全一致",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True, padx=10, pady=6)
+
+        # 左：文件列表
+        left = ttk.LabelFrame(body, text="文件（可拖拽或点击添加）")
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        cols = ("name", "size", "info")
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="extended")
+        self.tree.heading("name", text="文件名")
+        self.tree.heading("size", text="大小")
+        self.tree.heading("info", text="说明")
+        self.tree.column("name", width=300, anchor="w")
+        self.tree.column("size", width=90, anchor="e")
+        self.tree.column("info", width=140, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=6, pady=6)
+        sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.place(relx=1.0, rely=0, relheight=1.0, anchor="ne")
+
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(btns, text="添加文件", command=self.add_files).pack(side="left")
+        ttk.Button(btns, text="移除选中", command=self.remove_selected).pack(side="left", padx=6)
+        ttk.Button(btns, text="清空", command=self.clear_files).pack(side="left")
+
+        if self.has_dnd:
+            try:
+                self.tree.drop_target_register(DND_FILES)
+                self.tree.dnd_bind("<<Drop>>", self._on_drop)
+                left.configure(labelwidget=ttk.Label(left, text="文件（把文件拖到这里）"))
+            except tk.TclError:
+                # root 不是 TkinterDnD.Tk()，降级为按钮选择
+                self.has_dnd = False
+
+        # 右：选项
+        right = ttk.LabelFrame(body, text="选项")
+        right.pack(side="right", fill="y", padx=(8, 0), ipadx=6)
+
+        self.mode = tk.StringVar(value="pack")
+        ttk.Label(right, text="操作模式").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Radiobutton(right, text="打包（文档 → 文本）", variable=self.mode,
+                        value="pack").grid(row=1, column=0, sticky="w", padx=10)
+        ttk.Radiobutton(right, text="还原（文本 → 文档）", variable=self.mode,
+                        value="unpack").grid(row=2, column=0, sticky="w", padx=10)
+
+        self.preset = tk.StringVar(value="chars")
+        self.codec = tk.StringVar(value=ct.PRESETS["chars"]["codec"])
+        self.compress = tk.StringVar(value=ct.PRESETS["chars"]["compress"])
+        self.cipher = tk.StringVar(value="none")
+
+        self._param_label(right, 3, "预设", "preset")
+        preset_box = ttk.Combobox(right, textvariable=self.preset, width=22, state="readonly",
+                                  values=["chars（字数最少）", "compact（ASCII 体积最小）",
+                                          "safe（纯大写+数字，耐复制）",
+                                          "fast（速度快）", "plain（不压缩）", "自定义"])
+        preset_box.grid(row=4, column=0, sticky="ew", padx=10)
+        preset_box.set("chars（字数最少）")
+        preset_box.bind("<<ComboboxSelected>>", self._on_preset)
+
+        self._param_label(right, 5, "编码器", "codec")
+        ttk.Combobox(right, textvariable=self.codec, width=22, state="readonly",
+                     values=list(codec_mod.CODECS)).grid(row=6, column=0, sticky="ew", padx=10)
+
+        self._param_label(right, 7, "压缩器", "compress")
+        ttk.Combobox(right, textvariable=self.compress, width=22, state="readonly",
+                     values=["auto", "lzma", "zlib", "bz2", "none"]).grid(
+            row=8, column=0, sticky="ew", padx=10)
+
+        self._param_label(right, 9, "加密器", "cipher")
+        ttk.Combobox(right, textvariable=self.cipher, width=22, state="readonly",
+                     values=["none", "aes-256-gcm"]).grid(row=10, column=0, sticky="ew", padx=10)
+
+        self._param_label(right, 11, "口令", "password")
+        self.password = tk.StringVar()
+        entry = ttk.Entry(right, textvariable=self.password, width=24, show="●")
+        entry.grid(row=12, column=0, sticky="ew", padx=10)
+
+        self.show_pwd = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="显示口令", variable=self.show_pwd,
+                        command=lambda: entry.configure(show="" if self.show_pwd.get() else "●")
+                        ).grid(row=13, column=0, sticky="w", padx=10)
+
+        self._param_label(right, 14, "输出目录", "outdir")
+        self.out_dir = tk.StringVar(value="")
+        out_row = ttk.Frame(right)
+        out_row.grid(row=15, column=0, sticky="ew", padx=10)
+        ttk.Entry(out_row, textvariable=self.out_dir, width=16).pack(side="left", fill="x", expand=True)
+        ttk.Button(out_row, text="…", width=3, command=self.pick_out_dir).pack(side="left", padx=(4, 0))
+
+        self._param_label(right, 16, "分片输出", "split")
+        self.split_enabled = tk.BooleanVar(value=False)
+        seg_row = ttk.Frame(right)
+        seg_row.grid(row=17, column=0, sticky="ew", padx=10)
+        self.split_chk = ttk.Checkbutton(seg_row, text="启用", variable=self.split_enabled,
+                                         command=self._on_split_toggle)
+        self.split_chk.pack(side="left")
+        self.segment = tk.StringVar(value=str(ct.DEFAULT_SEGMENT_CHARS))
+        self.seg_entry = ttk.Entry(seg_row, textvariable=self.segment, width=8, state="disabled")
+        self.seg_entry.pack(side="left", padx=(6, 4))
+        ttk.Label(seg_row, text="字/段").pack(side="left")
+
+        self.go = ttk.Button(right, text="开始处理", style="Go.TButton", command=self.start)
+        self.go.grid(row=18, column=0, sticky="ew", padx=10, pady=(16, 4))
+
+        self.open_btn = ttk.Button(right, text="打开输出文件夹", command=self.open_out_dir)
+        self.open_btn.grid(row=19, column=0, sticky="ew", padx=10, pady=(0, 4))
+
+        self.paste_btn = ttk.Button(right, text="粘贴文本还原…", command=self.paste_unpack)
+        self.paste_btn.grid(row=20, column=0, sticky="ew", padx=10, pady=(0, 4))
+
+        self.help_btn = ttk.Button(right, text="全部参数说明…",
+                                   command=lambda: self._show_help(None))
+        self.help_btn.grid(row=21, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        self._on_split_toggle()
+        try:
+            self.mode.trace_add("write", lambda *_: self._sync_mode())
+        except AttributeError:  # Tk < 8.6
+            self.mode.trace("w", lambda *_: self._sync_mode())
+
+        # 底部：日志
+        bottom = ttk.LabelFrame(self.root, text="日志")
+        bottom.pack(fill="both", padx=10, pady=(4, 10))
+        self.progress = ttk.Progressbar(bottom, mode="determinate")
+        self.progress.pack(fill="x", padx=8, pady=(8, 4))
+        self.log = tk.Text(bottom, height=8, wrap="none", font=("Consolas", 9),
+                           bg="#fbfbfb", relief="flat", state="disabled")
+        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    # ---------------- 文件管理 ----------------
+    def _on_drop(self, event):
+        paths = self.root.tk.splitlist(event.data)
+        self._add(list(paths))
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(title="选择文件")
+        if paths:
+            self._add(list(paths))
+
+    def _add(self, paths: list[str]):
+        for path in paths:
+            if not os.path.isfile(path):
+                continue
+            if path in self.files:
+                continue
+            self.files.append(path)
+            self._refresh_row(path)
+
+    def _refresh_row(self, path: str):
+        size = os.path.getsize(path)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in OFFICE_EXTS:
+            info = "Office 文档"
+        elif ext in TEXT_EXTS:
+            info = "文本容器"
+        else:
+            info = "其他二进制"
+        if self.tree.exists(path):
+            self.tree.item(path, values=(os.path.basename(path), _human(size), info))
+        else:
+            self.tree.insert("", "end", iid=path, values=(os.path.basename(path), _human(size), info))
+
+    def remove_selected(self):
+        for iid in self.tree.selection():
+            if iid in self.files:
+                self.files.remove(iid)
+            self.tree.delete(iid)
+
+    def clear_files(self):
+        self.files.clear()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
+    def pick_out_dir(self) -> str | None:
+        path = filedialog.askdirectory(title="选择输出目录")
+        if path:
+            self.out_dir.set(path)
+            return path
+        return None
+
+    def open_out_dir(self):
+        """打开输出文件夹：优先用上一轮实际产出的目录。"""
+        path = self.last_out_dir or self.out_dir.get().strip() or None
+        if not path or not os.path.isdir(path):
+            path = self.pick_out_dir()
+            if not path:
+                return
+        try:
+            os.startfile(path)  # noqa: S606 - 交给资源管理器打开
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, "无法打开文件夹：\n%s\n\n%s" % (path, exc))
+
+    def paste_unpack(self):
+        """手动粘贴容器文本还原：完整容器、单个分片、多个分片混在一起都支持。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("粘贴文本还原")
+        dlg.geometry("840x580")
+        dlg.minsize(620, 420)
+        dlg.transient(self.root)
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+
+        ttk.Label(
+            dlg,
+            text="把容器文本粘到下面：完整容器 / 单个分片 / 多个分片混在一起（顺序随意）都支持。",
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+
+        wrap = ttk.Frame(dlg)
+        wrap.pack(fill="both", expand=True, padx=12)
+        box = tk.Text(wrap, wrap="none", font=("Consolas", 9), undo=True)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=box.yview)
+        box.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+
+        hint = ttk.Label(dlg, text="", justify="left", wraplength=780)
+        hint.pack(anchor="w", padx=12, pady=(6, 0))
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=12, pady=10)
+
+        def inspect():
+            text = box.get("1.0", "end-1c")
+            if not text.strip():
+                hint.configure(text="")
+                return
+            try:
+                info = ct.inspect_text(text)
+            except ct.ContainerError as exc:
+                hint.configure(text="✗ %s" % exc, foreground="#c00")
+                return
+            total = info.get("segments_total")
+            if total:
+                got = info.get("segments_received", 0)
+                miss = info.get("segments_missing") or []
+                if miss:
+                    hint.configure(
+                        text="共 %d 段，已收 %d 段，缺第 %s 段"
+                             % (total, got, "、".join(str(i) for i in miss)),
+                        foreground="#c60")
+                else:
+                    hint.configure(text="共 %d 段，已全部收到，可以还原" % total,
+                                   foreground="#0a7")
+            else:
+                hint.configure(
+                    text="完整容器：%s（%s）"
+                         % (info.get("name"), _human(info.get("size") or 0)),
+                    foreground="#0a7")
+
+        def from_clipboard():
+            try:
+                data = dlg.clipboard_get()
+            except tk.TclError:
+                hint.configure(text="剪贴板里没有文本", foreground="#c00")
+                return
+            if box.get("1.0", "end-1c").strip():
+                box.insert("end", "\n")
+            box.insert("end", data)
+            inspect()
+
+        def clear_all():
+            box.delete("1.0", "end")
+            hint.configure(text="")
+
+        def do_unpack():
+            text = box.get("1.0", "end-1c")
+            if not text.strip():
+                messagebox.showwarning("提示", "文本框是空的", parent=dlg)
+                return
+            password = self.password.get() or None
+            try:
+                info = ct.inspect_text(text)
+            except ct.ContainerError as exc:
+                messagebox.showerror("无法解析", str(exc), parent=dlg)
+                return
+            if (info.get("cipher") or {}).get("alg", "none") != "none" and not password:
+                messagebox.showwarning(
+                    "需要口令", "这份文本是加密的，请先在主界面的「口令」里填写", parent=dlg)
+                return
+            out_dir = self.out_dir.get().strip() or None
+            try:
+                path, meta = ct.unpack_pasted(text, out_dir, password)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("还原失败", str(exc), parent=dlg)
+                return
+            self._log("✅ 粘贴还原 → %s" % path)
+            self._log("   %s，SHA-256 校验通过 %s…"
+                      % (_human(meta["size"]), meta["sha256"][:16]))
+            dlg.destroy()
+            self._finish({"ok": 1, "fail": 0, "outputs": [path], "errors": []})
+
+        ttk.Button(bar, text="从剪贴板粘贴", command=from_clipboard).pack(side="left")
+        ttk.Button(bar, text="检查分片", command=inspect).pack(side="left", padx=6)
+        ttk.Button(bar, text="清空", command=clear_all).pack(side="left")
+        ttk.Button(bar, text="关闭", command=dlg.destroy).pack(side="right")
+        ttk.Button(bar, text="还原", style="Go.TButton",
+                   command=do_unpack).pack(side="right", padx=6)
+
+        box.focus_set()
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+    def _on_preset(self, _event=None):
+        label = self.preset.get()
+        key = label.split("（")[0].strip()
+        if key in ct.PRESETS:
+            cfg = ct.PRESETS[key]
+            self.codec.set(cfg["codec"])
+            self.compress.set(cfg["compress"])
+
+    def _on_split_toggle(self):
+        """只有勾选「分片」时才允许填每段字符数。"""
+        enabled = self.split_enabled.get() and self.mode.get() == "pack"
+        try:
+            self.seg_entry.configure(state="normal" if enabled else "disabled")
+        except tk.TclError:
+            pass
+
+    def _sync_mode(self):
+        """切换打包/还原时联动分片开关的可用状态。"""
+        try:
+            self.split_chk.configure(
+                state="normal" if self.mode.get() == "pack" else "disabled")
+        except tk.TclError:
+            pass
+        self._on_split_toggle()
+
+    # ---------------- 参数说明 ----------------
+    def _param_label(self, parent, row, text, key):
+        """参数名 + 可点击的 ? 说明入口。"""
+        box = ttk.Frame(parent)
+        box.grid(row=row, column=0, sticky="w", padx=10, pady=6)
+        ttk.Label(box, text=text).pack(side="left")
+        mark = ttk.Label(box, text="?", foreground="#0a58ca", cursor="hand2")
+        mark.pack(side="left", padx=(4, 0))
+        mark.bind("<Button-1>", lambda _e, k=key: self._show_help(k))
+        return box
+
+    def _current_value(self, key: str) -> str:
+        if key == "preset":
+            return self.preset.get().split("（")[0].strip()
+        if key == "codec":
+            return self.codec.get()
+        if key == "compress":
+            return self.compress.get()
+        if key == "cipher":
+            return self.cipher.get()
+        if key == "outdir":
+            return "set" if self.out_dir.get().strip() else ""
+        if key == "split":
+            return "on" if self.split_enabled.get() else "off"
+        return ""
+
+    def _show_help(self, key: str | None = None):
+        """弹出参数说明；key=None 时列出全部。当前选中的选项会高亮。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("参数说明" if key is None else "参数说明 · " + HELP[key][0])
+        dlg.geometry("820x600")
+        dlg.minsize(520, 360)
+        dlg.transient(self.root)
+
+        wrap = ttk.Frame(dlg)
+        wrap.pack(fill="both", expand=True, padx=4, pady=(10, 4))
+        txt = tk.Text(wrap, wrap="word", font=("Microsoft YaHei UI", 10),
+                      padx=16, pady=12, relief="flat", bg="#fcfcfc")
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        txt.tag_configure("title", font=("Microsoft YaHei UI", 12, "bold"), spacing3=4)
+        txt.tag_configure("intro", foreground="#555", spacing3=10)
+        txt.tag_configure("name", font=("Consolas", 10, "bold"), lmargin1=4, spacing1=7)
+        txt.tag_configure("cur", font=("Consolas", 10, "bold"), foreground="#0a58ca",
+                          lmargin1=4, spacing1=7)
+        txt.tag_configure("desc", foreground="#333", lmargin1=24, lmargin2=24, spacing3=4)
+
+        for k in ([key] if key else list(HELP)):
+            title, intro, items = HELP[k]
+            txt.insert("end", title + "\n", "title")
+            txt.insert("end", intro + "\n", "intro")
+            current = self._current_value(k)
+            for name, desc in items:
+                hit = bool(current) and bool(name) and (
+                    name == current or current.startswith(name))
+                txt.insert("end", ("▶ " if hit else "  ") + (name or "（留空）") + "\n",
+                           "cur" if hit else "name")
+                txt.insert("end", desc + "\n", "desc")
+            txt.insert("end", "\n")
+
+        txt.configure(state="disabled")
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Label(bar, text="▶ = 当前选中", foreground="#0a58ca").pack(side="left")
+        ttk.Button(bar, text="关闭", command=dlg.destroy).pack(side="right")
+
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.focus_set()
+
+    # ---------------- 执行 ----------------
+    def _log(self, msg: str):
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        if not self.files:
+            messagebox.showinfo(APP_TITLE, "请先添加文件")
+            return
+        mode = self.mode.get()
+        password = self.password.get() or None
+        cipher = self.cipher.get()
+        if cipher != "none" and not password:
+            messagebox.showwarning(APP_TITLE, "已选择加密器，请填写口令")
+            return
+        out_dir = self.out_dir.get().strip() or None
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        segment = 0
+        if mode == "pack" and self.split_enabled.get():
+            seg_text = self.segment.get().strip()
+            segment = (int(seg_text) if seg_text.isdigit() and int(seg_text) > 0
+                       else ct.DEFAULT_SEGMENT_CHARS)
+
+        self.go.configure(state="disabled", text="处理中…")
+        self.progress.configure(maximum=len(self.files), value=0)
+        self._log("── 开始%s，共 %d 个文件 ──" % ("打包" if mode == "pack" else "还原", len(self.files)))
+        files = list(self.files)
+        self.worker = threading.Thread(
+            target=self._run,
+            args=(mode, files, out_dir, password, cipher,
+                  self.codec.get(), self.compress.get(), segment),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _run(self, mode, files, out_dir, password, cipher, codec_name, compress_mode, segment):
+        ok = 0
+        outputs: list[str] = []
+        errors: list[str] = []
+
+        if mode == "unpack":
+            # 分段必须整体合并还原，不能逐个文件处理
+            try:
+                results = ct.unpack_sources(files, out_dir, password)
+                for path, meta in results:
+                    outputs.append(path)
+                    ok += 1
+                    self.queue.put(("log",
+                        "✅ 还原 → %s\n   %d 字节，SHA-256 校验通过 %s…" % (
+                            path, meta["size"], meta["sha256"][:16])))
+            except Exception as exc:
+                errors.append("还原失败：%s" % exc)
+                self.queue.put(("log", "✗ 还原失败：%s" % exc))
+            self.queue.put(("tick", len(files)))
+            self.queue.put(("done", {"ok": ok, "fail": len(files) - ok,
+                                     "outputs": outputs, "errors": errors}))
+            return
+
+        for src in files:
+            name = os.path.basename(src)
+            try:
+                out_path = None
+                if out_dir:
+                    out_path = os.path.join(
+                        out_dir, os.path.basename(ct.default_out_path(src, codec_name))
+                    )
+                paths, meta = ct.pack_file(
+                    src, out_path, codec_name=codec_name,
+                    cipher_name=cipher, password=password,
+                    compress=compress_mode, segment=max(segment, 0),
+                )
+                outputs.extend(paths)
+                ok += 1
+                text_size = sum(os.path.getsize(p) for p in paths)
+                seg_note = "，分成 %d 段" % len(paths) if len(paths) > 1 else ""
+                self.queue.put(("log",
+                    "✅ %s  %s → 文本 %s / %d 字符（%s/%s/%s）%s\n   → %s" % (
+                        name, _human(meta["size"]), _human(text_size),
+                        meta["text_chars"],
+                        meta["codec"], (meta.get("compress") or {}).get("alg", "none"),
+                        (meta.get("cipher") or {}).get("alg", "none"), seg_note,
+                        paths[0] if len(paths) == 1
+                        else "%s … %s" % (paths[0], os.path.basename(paths[-1])))))
+            except Exception as exc:
+                errors.append("%s：%s" % (name, exc))
+                self.queue.put(("log", "✗ %s：%s" % (name, exc)))
+            self.queue.put(("tick", 1))
+        self.queue.put(("done", {"ok": ok, "fail": len(files) - ok,
+                                 "outputs": outputs, "errors": errors}))
+
+    def _finish(self, info: dict):
+        """一轮处理结束：日志汇总 + 明确的弹窗提示 + 输出位置。"""
+        ok, fail = info["ok"], info["fail"]
+        outputs, errors = info["outputs"], info["errors"]
+
+        self.go.configure(state="normal", text="开始处理")
+        self.progress.configure(value=0)
+        self._log("── 完成：成功 %d / 失败 %d ──" % (ok, fail))
+
+        if outputs:
+            self.last_out_dir = os.path.dirname(outputs[0])
+            self._log("输出文件夹：%s" % self.last_out_dir)
+            for path in outputs[:6]:
+                self._log("   · %s" % os.path.basename(path))
+            if len(outputs) > 6:
+                self._log("   · …共 %d 个文件" % len(outputs))
+        else:
+            self.last_out_dir = self.out_dir.get().strip() or None
+
+        if fail:
+            detail = "\n".join(errors[:8]) or "未知原因"
+            if len(errors) > 8:
+                detail += "\n…"
+            messagebox.showerror(
+                APP_TITLE,
+                "处理结束：成功 %d 个，失败 %d 个\n\n失败原因：\n%s"
+                % (ok, fail, detail),
+            )
+            return
+
+        if not outputs:
+            messagebox.showwarning(APP_TITLE, "没有生成任何文件，请检查输入。")
+            return
+
+        where = self.last_out_dir or "(原文件所在目录)"
+        ask = "处理完成：成功 %d 个文件。\n\n输出位置：\n%s\n" % (ok, where)
+        if len(outputs) > 1:
+            ask += "（共 %d 个文件）\n" % len(outputs)
+        ask += "\n是否打开该文件夹？"
+        if messagebox.askyesno(APP_TITLE, ask):
+            self.open_out_dir()
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                if kind == "log":
+                    self._log(payload)
+                elif kind == "tick":
+                    self.progress.step(payload)
+                elif kind == "done":
+                    self._finish(payload)
+        except queue.Empty:
+            pass
+        self.root.after(120, self._poll_queue)
+
+
+def main() -> int:
+    if _HAS_DND:
+        try:
+            root = TkinterDnD.Tk()
+            has_dnd = True
+        except Exception:  # pragma: no cover
+            root = tk.Tk()
+            has_dnd = False
+    else:
+        root = tk.Tk()
+        has_dnd = False
+    App(root, has_dnd)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

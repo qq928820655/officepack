@@ -1,0 +1,14 @@
+# 批处理文件是 GBK 编码，禁止 Git 改动换行符（否则中文会乱码）
+*.cmd -text
+*.bat -text
+
+# 其余文本统一按 LF 入库
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.doc binary
+*.exe binary
+*.zip binary

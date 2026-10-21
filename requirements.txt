@@ -1,0 +1,13 @@
+# officepack 运行依赖
+# 安装：python -m pip install -r requirements.txt
+#
+# Python 3.10+（开发与打包用的是 3.14），tkinter 由 Python 自带，无需 pip 安装。
+# 标准库之外只依赖下面这几个，全部有 Windows 预编译 wheel。
+
+cryptography>=41.0        # AES-256-GCM 分块加密（不加密也要装，crypto 模块会 import）
+Pillow>=10.0              # 二维码图片读写、剪贴板截图
+qrcode>=8.0               # 生成二维码（显式控制纠错级别与版本）
+zxing-cpp>=2.2            # 识别二维码（截图、缩放、多码同图都稳）
+
+# 可选：只有想要「把文件拖进窗口」才需要
+tkinterdnd2>=0.4

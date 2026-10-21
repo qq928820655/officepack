@@ -45,8 +45,22 @@ from .compress import CompressError, decompress
 from .compress import compress as compress_bytes
 from .crypto import CryptoError, make_cipher
 from .preview import extract_preview
+from .qr import (
+    ALNUM_CODECS,
+    DEFAULT_EC,
+    QR_ALNUM_CAPACITY,
+    QR_CODEC,
+    QRError,
+    build_frames,
+    decode_image,
+    decode_images,
+    inspect_images,
+    is_image_path,
+    render_images,
+    unpack_images,
+)
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 __all__ = [
     "BEGIN",
@@ -85,5 +99,18 @@ __all__ = [
     "decompress",
     "make_cipher",
     "extract_preview",
+    # 二维码通道
+    "QR_CODEC",
+    "QR_ALNUM_CAPACITY",
+    "DEFAULT_EC",
+    "ALNUM_CODECS",
+    "QRError",
+    "build_frames",
+    "render_images",
+    "decode_images",
+    "decode_image",
+    "unpack_images",
+    "inspect_images",
+    "is_image_path",
     "__version__",
 ]

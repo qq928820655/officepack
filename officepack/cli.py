@@ -17,6 +17,7 @@ import sys
 
 from . import container as ct
 from . import codecs as codec_mod
+from . import qr
 from .compress import CompressError, compress
 from . import crypto as crypto_mod
 from . import __version__
@@ -79,6 +80,10 @@ def cmd_pack(args) -> int:
     out_dir = args.out_dir
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+
+    if args.qr:
+        return _pack_as_qr(args, codec_name, compress_mode, level,
+                           cipher_name, password, out_dir)
 
     segment = 0 if args.no_split else (args.split or 0)
     parts = 0 if args.no_split else (args.parts or 0)
@@ -159,6 +164,68 @@ def cmd_pack(args) -> int:
     return 1 if failed else 0
 
 
+def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, out_dir) -> int:
+    """二维码通道：一帧一张 PNG，扫码工具（AirScan-QR / 鹊桥 / 手机相机）都能读。"""
+    if codec_name not in qr.ALNUM_CODECS:
+        print("· 二维码通道需要纯大写字母数字，已自动把编码器 %s 换成 %s"
+              % (codec_name, qr.QR_CODEC))
+        codec_name = qr.QR_CODEC
+
+    failed = 0
+    for src in args.files:
+        if not os.path.isfile(src):
+            print("✗ 文件不存在：%s" % src)
+            failed += 1
+            continue
+        try:
+            with open(src, "rb") as fh:
+                raw = fh.read()
+            pack = ct.pack_bytes(
+                raw,
+                os.path.basename(src),
+                codec_name=codec_name,
+                alphabet=args.alphabet,
+                cipher_name=cipher_name,
+                password=password,
+                compress=compress_mode,
+                level=level,
+                preview=False,
+                ascii_only=True,
+            )
+            frames = qr.build_frames(pack, ec=args.qr_ec, chars_per_frame=args.qr_chars)
+        except (ct.ContainerError, codec_mod.CodecError, CompressError,
+                crypto_mod.CryptoError, qr.QRError, OSError) as exc:
+            print("✗ %s：%s" % (os.path.basename(src), exc))
+            failed += 1
+            continue
+
+        target_dir = out_dir or os.path.dirname(os.path.abspath(src))
+        stem = os.path.basename(src)
+        try:
+            res = qr.render_images(frames, target_dir, stem, ec=args.qr_ec,
+                                   sheet=not args.no_sheet, target_px=args.qr_px)
+        except (qr.QRError, OSError) as exc:
+            print("✗ %s：生成二维码失败 %s" % (os.path.basename(src), exc))
+            failed += 1
+            continue
+
+        meta = pack.meta
+        print("✅ %s" % os.path.basename(src))
+        print("   原始 %s → %d 张二维码（%s，纠错 %s，%d 帧字符）"
+              % (_human(meta["size"]), len(frames), meta["codec"],
+                 args.qr_ec.upper(), meta["text_chars"]))
+        print("   输出目录 %s" % res["dir"])
+        if res["sheet"]:
+            print("   总览图 %s（一张截图即可带回全部帧）" % os.path.basename(res["sheet"]))
+        print("   单帧图 %s … %s" % (os.path.basename(res["images"][0]),
+                                    os.path.basename(res["images"][-1])))
+        print("   还原：officepack unpack 图片或目录 [-p 口令]")
+        if len(frames) > qr.MAX_SHEET_TILES:
+            print("   ⚠ 共 %d 帧，未生成总览图（过多会降低识别率），请逐张传输"
+                  % len(frames))
+    return 1 if failed else 0
+
+
 def cmd_unpack(args) -> int:
     out_dir = args.out_dir
     if out_dir:
@@ -166,14 +233,29 @@ def cmd_unpack(args) -> int:
 
     use_stdin = "-" in args.files
     paths = [p for p in args.files if p != "-"]
-    missing = [p for p in paths if not os.path.isfile(p)]
+
+    # 输入按类型分流：图片（二维码）走扫码，其余当文本容器；目录整目录扫
+    image_srcs = [p for p in paths
+                  if os.path.isdir(p) or qr.is_image_path(p)]
+    text_srcs = [p for p in paths if p not in image_srcs]
+
+    missing = [p for p in text_srcs if not os.path.isfile(p)]
     for path in missing:
         print("✗ 文件不存在：%s" % path)
-    targets = [p for p in paths if os.path.isfile(p)]
-    if not targets and not use_stdin:
+    targets = [p for p in text_srcs if os.path.isfile(p)]
+    if not targets and not image_srcs and not use_stdin:
         return 1
 
     texts: list[str] = []
+    if image_srcs:
+        try:
+            shots = qr.decode_images(image_srcs)
+        except (qr.QRError, OSError) as exc:
+            print("✗ 二维码识别失败：%s" % exc)
+            return 1
+        texts.extend(shots)
+        print("· 从 %d 个图片来源扫到 %d 段内容" % (len(image_srcs), len(shots)))
+
     for src in targets:
         try:
             texts.append(_read_text(src))
@@ -199,8 +281,11 @@ def cmd_unpack(args) -> int:
             continue
     password = _password(args, need=need_pwd)
 
-    if out_dir is None and targets:
-        out_dir = os.path.dirname(os.path.abspath(targets[0]))
+    if out_dir is None:
+        anchor = targets[0] if targets else (image_srcs[0] if image_srcs else None)
+        if anchor:
+            out_dir = (anchor if os.path.isdir(anchor)
+                       else os.path.dirname(os.path.abspath(anchor)))
 
     try:
         results = ct.unpack_texts(texts, out_dir, password, args.name)
@@ -292,7 +377,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例：\n"
             "  officepack pack 报表.docx --preset compact --password 123456\n"
+            "  officepack pack 报表.docx --qr              # 输出二维码图片\n"
             "  officepack unpack 报表.docx.base91.opk.txt --password 123456\n"
+            "  officepack unpack 截图.png                  # 从二维码截图还原\n"
             "  officepack gui\n"
         ),
     )
@@ -323,16 +410,26 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--parts", type=int, default=0, metavar="K",
                        help="切成 K 段（尽量均分）")
 
-    p_pack = sub.add_parser("pack", help="文档 → 文本")
+    p_pack = sub.add_parser("pack", help="文档 → 文本 / 二维码")
     p_pack.add_argument("files", nargs="+")
     p_pack.add_argument("-o", "--out-dir", help="输出目录")
+    p_pack.add_argument("--qr", action="store_true",
+                        help="改为输出二维码图片：一帧一张 PNG，可用 AirScan-QR / 鹊桥 / 手机相机传递")
+    p_pack.add_argument("--qr-ec", choices=["L", "M", "Q", "H"], default=qr.DEFAULT_EC,
+                        help="二维码纠错级别（默认 %s）：L 容量最大，H 最耐脏污" % qr.DEFAULT_EC)
+    p_pack.add_argument("--qr-chars", type=int, default=0, metavar="N",
+                        help="每帧载荷字符数上限（默认按容量自动算，可调小让每张码更好扫）")
+    p_pack.add_argument("--qr-px", type=int, default=960, metavar="N",
+                        help="每张二维码的目标像素宽（默认 960）")
+    p_pack.add_argument("--no-sheet", action="store_true",
+                        help="不生成总览图（默认帧数 ≤ %d 时会拼一张）" % qr.MAX_SHEET_TILES)
     add_pack_opts(p_pack)
     p_pack.set_defaults(func=cmd_pack)
 
-    p_unpack = sub.add_parser("unpack", help="文本 → 原始文档")
+    p_unpack = sub.add_parser("unpack", help="文本 / 二维码截图 → 原始文档")
     p_unpack.add_argument("files", nargs="+",
-                          help="容器文件；用 - 表示从标准输入读取（可粘贴，也可管道传入），"
-                               "分片可一次传入多个，顺序随意")
+                          help="容器文件或二维码图片/目录；用 - 表示从标准输入读取（可粘贴，"
+                               "也可管道传入），分片可一次传入多个，顺序随意")
     p_unpack.add_argument("-o", "--out-dir", help="输出目录")
     p_unpack.add_argument("--name", help="指定还原后的文件名")
     p_unpack.add_argument("--password", help="口令")

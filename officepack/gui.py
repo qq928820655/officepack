@@ -16,6 +16,7 @@ from . import container as ct
 from . import codecs as codec_mod
 from . import compress as compress_mod
 from . import crypto as crypto_mod
+from . import qr
 
 try:  # 拖拽支持为可选项
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover
 APP_TITLE = "officepack — Office 文档 ↔ 纯文本"
 OFFICE_EXTS = (".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm",
                ".ppt", ".pptx", ".pptm", ".rtf", ".odt", ".pdf")
-TEXT_EXTS = (".txt", ".opk")
+TEXT_EXTS = (".txt", ".opk") + qr.IMAGE_EXTS   # 还原时可选的：文本容器 + 二维码图片
 
 # 每个参数的说明：(标题, 一句话说明, [(选项名, 详细作用)])
 # 显示时会把「当前选中的选项」高亮出来，方便对照
@@ -107,6 +108,17 @@ HELP: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
             ("off", "不勾选：整份输出一个文件，最省事。"),
             ("on", "勾选后按「字/段」切分。每段自带段头（文档ID / 序号 / 总段数 / 校验）与段内字符数，"
                    "可乱序收集、段尾多粘文字也能自动截断；凑齐后一起还原，或直接粘进「粘贴文本还原」。"),
+        ],
+    ),
+    "qr": (
+        "输出二维码",
+        "不生成文本，改为每帧一张二维码 PNG，适合走扫码通道（AirScan-QR / 鹊桥 / 手机相机）传文件。",
+        [
+            ("off", "不勾选：按文本输出（.opk.txt）。"),
+            ("on", "勾选后输出二维码图片：一张码装不下时会自动拆成多帧，文件名带 001/002 序号；"
+                   "帧数不多时另附一张总览图，截一次屏就能把全部帧带回来。"
+                   "编码器会自动锁定为 base32 —— 纯大写字母数字才能命中二维码的紧凑模式。"),
+            ("back", "还原时把截图直接粘进来点「截图还原…」，或把 PNG 拖进列表，程序会自己扫码。"),
         ],
     ),
 }
@@ -199,9 +211,25 @@ class App:
                 # root 不是 TkinterDnD.Tk()，降级为按钮选择
                 self.has_dnd = False
 
-        # 右：选项
-        right = ttk.LabelFrame(body, text="选项")
-        right.pack(side="right", fill="y", padx=(8, 0), ipadx=6)
+        # 右：选项。放进可滚动画布 —— 高缩放或小屏上窗口再矮，
+        # 选项区也能滚动到底，不会像以前那样把底部按钮直接裁掉。
+        holder = ttk.Frame(body)
+        holder.pack(side="right", fill="y", padx=(8, 0))
+
+        self.opt_canvas = tk.Canvas(holder, highlightthickness=0, borderwidth=0,
+                                    width=232, height=560)
+        self.opt_vsb = ttk.Scrollbar(holder, orient="vertical", command=self.opt_canvas.yview)
+        self.opt_canvas.configure(yscrollcommand=self.opt_vsb.set)
+        self.opt_canvas.pack(side="left", fill="both", expand=True)
+
+        right = ttk.LabelFrame(self.opt_canvas, text="选项")
+        self.opt_frame = right
+        self._opt_window = self.opt_canvas.create_window((0, 0), window=right, anchor="nw")
+        right.bind("<Configure>", lambda _e: self._sync_opt_scroll())
+        self.opt_canvas.bind("<Configure>", self._on_opt_canvas_resize)
+        self.opt_canvas.bind("<Enter>", lambda _e: self.opt_canvas.bind_all(
+            "<MouseWheel>", self._on_opt_wheel))
+        self.opt_canvas.bind("<Leave>", lambda _e: self.opt_canvas.unbind_all("<MouseWheel>"))
 
         self.mode = tk.StringVar(value="pack")
         ttk.Label(right, text="操作模式").grid(row=0, column=0, sticky="w", **pad)
@@ -225,8 +253,9 @@ class App:
         preset_box.bind("<<ComboboxSelected>>", self._on_preset)
 
         self._param_label(right, 5, "编码器", "codec")
-        ttk.Combobox(right, textvariable=self.codec, width=22, state="readonly",
-                     values=list(codec_mod.CODECS)).grid(row=6, column=0, sticky="ew", padx=10)
+        self.codec_box = ttk.Combobox(right, textvariable=self.codec, width=22, state="readonly",
+                                      values=list(codec_mod.CODECS))
+        self.codec_box.grid(row=6, column=0, sticky="ew", padx=10)
 
         self._param_label(right, 7, "压缩器", "compress")
         ttk.Combobox(right, textvariable=self.compress, width=22, state="readonly",
@@ -269,18 +298,31 @@ class App:
         self.seg_entry.pack(side="left", padx=(6, 4))
         ttk.Label(seg_row, text="字/段").pack(side="left")
 
+        # 二维码输出（与分片互斥：二维码有自己的分帧规则）
+        self._param_label(right, 18, "输出二维码", "qr")
+        self.qr_enabled = tk.BooleanVar(value=False)
+        qr_row = ttk.Frame(right)
+        qr_row.grid(row=19, column=0, sticky="ew", padx=10)
+        self.qr_chk = ttk.Checkbutton(qr_row, text="生成图片", variable=self.qr_enabled,
+                                      command=self._on_qr_toggle)
+        self.qr_chk.pack(side="left")
+        ttk.Label(qr_row, text="每帧一张 PNG", style="Hint.TLabel").pack(side="left", padx=(8, 0))
+
         self.go = ttk.Button(right, text="开始处理", style="Go.TButton", command=self.start)
-        self.go.grid(row=18, column=0, sticky="ew", padx=10, pady=(12, 3))
+        self.go.grid(row=20, column=0, sticky="ew", padx=10, pady=(12, 3))
 
         self.open_btn = ttk.Button(right, text="打开输出文件夹", command=self.open_out_dir)
-        self.open_btn.grid(row=19, column=0, sticky="ew", padx=10, pady=(0, 3))
+        self.open_btn.grid(row=21, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.paste_btn = ttk.Button(right, text="粘贴文本还原…", command=self.paste_unpack)
-        self.paste_btn.grid(row=20, column=0, sticky="ew", padx=10, pady=(0, 3))
+        self.paste_btn.grid(row=22, column=0, sticky="ew", padx=10, pady=(0, 3))
+
+        self.shot_btn = ttk.Button(right, text="截图还原（二维码）…", command=self.qr_unpack)
+        self.shot_btn.grid(row=23, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.help_btn = ttk.Button(right, text="全部参数说明…",
                                    command=lambda: self._show_help(None))
-        self.help_btn.grid(row=21, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self.help_btn.grid(row=24, column=0, sticky="ew", padx=10, pady=(0, 8))
 
         self._on_split_toggle()
         try:
@@ -297,51 +339,144 @@ class App:
                            bg="#fbfbfb", relief="flat", state="disabled")
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
+    # ---------------- 选项区滚动 ----------------
+    def _on_opt_canvas_resize(self, event):
+        self.opt_canvas.itemconfigure(self._opt_window, width=event.width)
+        self._sync_opt_scroll()
+
+    def _sync_opt_scroll(self):
+        """内容比可视区高才挂滚动条，否则藏起来（平常看着和普通面板一样）。"""
+        try:
+            bbox = self.opt_canvas.bbox("all")
+            if not bbox:
+                return
+            self.opt_canvas.configure(scrollregion=bbox)
+            need = bbox[3] - bbox[1] > self.opt_canvas.winfo_height() + 1
+            shown = bool(self.opt_vsb.winfo_ismapped())
+            if need and not shown:
+                self.opt_vsb.pack(side="right", fill="y")
+            elif not need and shown:
+                self.opt_vsb.pack_forget()
+                self.opt_canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _on_opt_wheel(self, event):
+        try:
+            bbox = self.opt_canvas.bbox("all")
+            if not bbox or bbox[3] - bbox[1] <= self.opt_canvas.winfo_height() + 1:
+                return
+            self.opt_canvas.yview_scroll(int(-event.delta / 120), "units")
+        except tk.TclError:
+            pass
+
     # ---------------- 窗口尺寸 ----------------
+    def _work_area(self) -> tuple[int, int, int, int]:
+        """屏幕可用工作区 (left, top, right, bottom)：扣掉任务栏。
+
+        只减一个拍脑袋的常数，任务栏高一点就会把窗口底边压到任务栏下面。
+        """
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            rect = wt.RECT()
+            # SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                if rect.right - rect.left > 200 and rect.bottom - rect.top > 200:
+                    return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:
+            pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
     def _size_dialog(self, dlg, want_w, want_h, min_w, min_h):
         """对话框同样不能写死像素：按屏幕可用范围收窄，并居中到主窗口。"""
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        w = min(want_w, max(min_w, screen_w - 60))
-        h = min(want_h, max(min_h, screen_h - 120))
+        left, top, right, bottom = self._work_area()
+        avail_w, avail_h = right - left, bottom - top
+        w = min(want_w, max(min_w, avail_w - 40))
+        h = min(want_h, max(min_h, avail_h - 60))
         x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - w) // 2)
         y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - h) // 3)
-        dlg.geometry("%dx%d+%d+%d" % (w, h, max(0, x), max(0, y)))
+        x = min(max(x, left), max(left, right - w))
+        y = min(max(y, top), max(top, bottom - h))
+        dlg.geometry("%dx%d+%d+%d" % (w, h, x, y))
         dlg.minsize(min(min_w, w), min(min_h, h))
+
+    def _chrome_height(self) -> int:
+        """窗口外框比客户区多出来的高度（标题栏 + 边框）。
+
+        geometry 给的是客户区尺寸，标题栏是额外加上去的；
+        不留出这部分，窗口外框就会压到任务栏上（实测 125% 缩放是 39px）。
+        """
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            u32 = ctypes.windll.user32
+            hwnd = self.root.winfo_id()
+            frame = u32.GetParent(hwnd) or hwnd
+            rect = wt.RECT()
+            if u32.GetWindowRect(frame, ctypes.byref(rect)):
+                chrome = (rect.bottom - rect.top) - self.root.winfo_height()
+                if 0 <= chrome < 200:
+                    return chrome
+        except Exception:
+            pass
+        return 40
 
     def _fit_window(self):
         """按内容实测尺寸决定窗口大小，而不是写死像素。
 
         Tk 的 px 是物理像素，而字体大小会随系统缩放（125%/150%）放大，
         所以同一个 "980x660" 在高缩放屏幕上装不下内容，底部按钮会被裁掉。
-        这里先让 Tk 算出内容真正需要的尺寸，再钳制到屏幕可用范围内；
-        真的放不下时优先牺牲最不关键的日志框高度。
+        这里先让 Tk 算出内容真正需要的尺寸，再钳制到工作区范围内（并扣掉标题栏）；
+        真的放不下时优先牺牲最不关键的日志框高度，选项区还有滚动条兜底。
         """
         self.root.update_idletasks()
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        # 预留标题栏 + 任务栏
-        limit_w = max(720, screen_w - 40)
-        limit_h = max(520, screen_h - 90)
+        # 画布先按选项区的真实尺寸撑开，窗口才能一次显示全；
+        # 真要装不下时，再靠滚动条兜底（_sync_opt_scroll 里按需显示）。
+        self.opt_canvas.configure(width=self.opt_frame.winfo_reqwidth(),
+                                  height=self.opt_frame.winfo_reqheight())
+        self.root.update_idletasks()
 
-        req_w = self.root.winfo_reqwidth()
-        req_h = self.root.winfo_reqheight()
+        left, top, right, bottom = self._work_area()
+        avail_w, avail_h = right - left, bottom - top
+        chrome = self._chrome_height()
+        best = None
 
-        # 日志框从 6 行往下退，退到 2 行还不够就放弃（极端小屏）
-        while req_h > limit_h and self._log_lines > 2:
-            self._log_lines -= 1
-            self.log.configure(height=self._log_lines)
-            self.root.update_idletasks()
+        # 跑两遍：第一遍之后才知道标题栏真实高度，第二遍用实测值重算
+        for _ in range(2):
+            limit_h = max(480, avail_h - chrome - 10)
             req_h = self.root.winfo_reqheight()
+            # 日志框从 6 行往下退，退到 2 行还不够就交给滚动条
+            while req_h > limit_h and self._log_lines > 2:
+                self._log_lines -= 1
+                self.log.configure(height=self._log_lines)
+                self.root.update_idletasks()
+                req_h = self.root.winfo_reqheight()
 
-        w = min(max(req_w, 880), limit_w)
-        h = min(req_h, limit_h)
+            w = min(max(self.root.winfo_reqwidth(), 880), max(720, avail_w - 20))
+            h = min(req_h, limit_h)
+            x = left + max(0, (avail_w - w) // 2)
+            y = top + max(0, (avail_h - chrome - h) // 2)
+            self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+            # 下限就用算出来的尺寸：再缩小一定会切掉控件
+            self.root.minsize(w, h)
+            self.root.update_idletasks()
 
-        x = max(0, (screen_w - w) // 2)
-        y = max(0, (screen_h - h) // 2 - 24)
-        self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
-        # 下限就用算出来的尺寸：再缩小一定会切掉控件
-        self.root.minsize(w, h)
+            measured = self._chrome_height()
+            if best is None or measured == chrome:
+                best = (w, h, x, y)
+            if abs(measured - chrome) <= 2:
+                break
+            chrome = measured
+
+        if best:
+            w, h, x, y = best
+            self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+            self.root.minsize(w, h)
+            self.root.update_idletasks()
+        self._sync_opt_scroll()
 
     # ---------------- 文件管理 ----------------
     def _on_drop(self, event):
@@ -349,7 +484,15 @@ class App:
         self._add(list(paths))
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(title="选择文件")
+        paths = filedialog.askopenfilenames(
+            title="选择文件",
+            filetypes=[
+                ("全部支持的", " ".join("*" + e for e in OFFICE_EXTS + TEXT_EXTS)),
+                ("Office 文档", " ".join("*" + e for e in OFFICE_EXTS)),
+                ("文本容器 / 二维码图片", " ".join("*" + e for e in TEXT_EXTS)),
+                ("所有文件", "*.*"),
+            ],
+        )
         if paths:
             self._add(list(paths))
 
@@ -367,6 +510,8 @@ class App:
         ext = os.path.splitext(path)[1].lower()
         if ext in OFFICE_EXTS:
             info = "Office 文档"
+        elif ext in qr.IMAGE_EXTS:
+            info = "二维码图片"
         elif ext in TEXT_EXTS:
             info = "文本容器"
         else:
@@ -516,6 +661,67 @@ class App:
         box.focus_set()
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
 
+    def qr_unpack(self):
+        """从截图还原：优先读剪贴板里的截图，取不到再让人选图片文件。"""
+        paths: list[str] = []
+        inline = None
+        try:
+            from PIL import ImageGrab
+
+            clip = ImageGrab.grabclipboard()
+        except Exception:  # 没有 Pillow / 剪贴板读不到
+            clip = None
+
+        if isinstance(clip, list):
+            paths = [p for p in clip if qr.is_image_path(p)]
+        elif clip is not None:
+            inline = clip          # 剪贴板里直接就是一张图
+
+        if inline is None and not paths:
+            chosen = filedialog.askopenfilenames(
+                title="选择二维码截图（可多选）",
+                filetypes=[("图片", " ".join("*" + e for e in qr.IMAGE_EXTS)),
+                           ("所有文件", "*.*")],
+            )
+            paths = list(chosen)
+        if inline is None and not paths:
+            return
+
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            if inline is not None:
+                texts = qr.decode_image(inline)
+                if not texts:
+                    raise qr.QRError("剪贴板里的图片没有识别到二维码，"
+                                     "请让整张码完整进入截图、不要缩小")
+                source = "剪贴板截图"
+            else:
+                texts = qr.decode_images(paths)
+                source = "%d 张图片" % len(paths)
+            password = self.password.get() or None
+            out_dir = self.out_dir.get().strip() or None
+            results = ct.unpack_texts(texts, out_dir, password)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, "截图还原失败：\n%s" % exc)
+            self._log("✗ 截图还原失败：%s" % exc)
+            return
+        finally:
+            self.root.configure(cursor="")
+            self.root.update_idletasks()
+
+        for path, meta in results:
+            self._log("✅ 截图还原 → %s\n   %d 字节，SHA-256 校验通过 %s…"
+                      % (path, meta["size"], meta["sha256"][:16]))
+        self.last_out_dir = os.path.dirname(results[0][0])
+        self._log("来源 %s，输出文件夹：%s" % (source, self.last_out_dir))
+        if messagebox.askyesno(
+            APP_TITLE,
+            "已从%s还原 %d 个文件\n\n%s\n\n打开所在文件夹？"
+            % (source, len(results), self.last_out_dir),
+        ):
+            self.open_out_dir()
+
     def _on_preset(self, _event=None):
         label = self.preset.get()
         key = label.split("（")[0].strip()
@@ -532,14 +738,37 @@ class App:
         except tk.TclError:
             pass
 
-    def _sync_mode(self):
-        """切换打包/还原时联动分片开关的可用状态。"""
+    def _on_qr_toggle(self):
+        """二维码与分片互斥：二维码自带分帧，编码器也必须换成 base32。"""
+        pack = self.mode.get() == "pack"
+        on = self.qr_enabled.get() and pack
+        # 分片开关让位（还原模式下本来就不可用）
         try:
-            self.split_chk.configure(
-                state="normal" if self.mode.get() == "pack" else "disabled")
+            self.split_chk.configure(state="normal" if (pack and not on) else "disabled")
+        except tk.TclError:
+            pass
+        if on:
+            self.split_enabled.set(False)
+            # 纯大写字母+数字才能命中二维码的字母数字模式
+            self.codec.set(qr.QR_CODEC)
+        try:
+            self.codec_box.configure(state="disabled" if on else "readonly")
         except tk.TclError:
             pass
         self._on_split_toggle()
+
+    def _sync_mode(self):
+        """切换打包/还原时联动分片、二维码开关的可用状态。"""
+        pack = self.mode.get() == "pack"
+        try:
+            self.split_chk.configure(state="normal" if pack else "disabled")
+            self.qr_chk.configure(state="normal" if pack else "disabled")
+        except tk.TclError:
+            pass
+        if not pack:
+            self.qr_enabled.set(False)
+        self._on_split_toggle()
+        self._on_qr_toggle()
 
     # ---------------- 参数说明 ----------------
     def _param_label(self, parent, row, text, key):
@@ -565,6 +794,8 @@ class App:
             return "set" if self.out_dir.get().strip() else ""
         if key == "split":
             return "on" if self.split_enabled.get() else "off"
+        if key == "qr":
+            return "on" if self.qr_enabled.get() else "off"
         return ""
 
     def _show_help(self, key: str | None = None):
@@ -648,20 +879,28 @@ class App:
         self.worker = threading.Thread(
             target=self._run,
             args=(mode, files, out_dir, password, cipher,
-                  self.codec.get(), self.compress.get(), segment),
+                  self.codec.get(), self.compress.get(), segment,
+                  self.qr_enabled.get() and mode == "pack"),
             daemon=True,
         )
         self.worker.start()
 
-    def _run(self, mode, files, out_dir, password, cipher, codec_name, compress_mode, segment):
+    def _run(self, mode, files, out_dir, password, cipher, codec_name, compress_mode,
+             segment, as_qr=False):
         ok = 0
         outputs: list[str] = []
         errors: list[str] = []
 
         if mode == "unpack":
-            # 分段必须整体合并还原，不能逐个文件处理
+            # 分段必须整体合并还原，不能逐个文件处理；二维码图片自动扫码
             try:
-                results = ct.unpack_sources(files, out_dir, password)
+                has_image = any(qr.is_image_path(f) for f in files)
+                if has_image:
+                    results, stats = qr.unpack_any(files, out_dir, password)
+                    self.queue.put(("log",
+                        "· 从 %d 张图片扫回 %d 段内容" % (stats["images"], stats["blocks"])))
+                else:
+                    results = ct.unpack_sources(files, out_dir, password)
                 for path, meta in results:
                     outputs.append(path)
                     ok += 1
@@ -679,6 +918,12 @@ class App:
         for src in files:
             name = os.path.basename(src)
             try:
+                if as_qr:
+                    paths = self._pack_one_qr(src, name, out_dir, password, cipher,
+                                              compress_mode, outputs)
+                    ok += 1
+                    continue
+
                 out_path = None
                 if out_dir:
                     out_path = os.path.join(
@@ -707,6 +952,31 @@ class App:
             self.queue.put(("tick", 1))
         self.queue.put(("done", {"ok": ok, "fail": len(files) - ok,
                                  "outputs": outputs, "errors": errors}))
+
+    def _pack_one_qr(self, src, name, out_dir, password, cipher, compress_mode, outputs):
+        """单个文件走二维码通道；返回写出的图片路径。"""
+        with open(src, "rb") as fh:
+            raw = fh.read()
+        pack = ct.pack_bytes(
+            raw, name, codec_name=qr.QR_CODEC,
+            cipher_name=cipher, password=password,
+            compress=compress_mode, preview=False, ascii_only=True,
+        )
+        frames = qr.build_frames(pack, ec=qr.DEFAULT_EC)
+        target_dir = out_dir or os.path.dirname(os.path.abspath(src))
+        res = qr.render_images(frames, target_dir, name, ec=qr.DEFAULT_EC, sheet=True)
+        outputs.extend(res["images"])
+
+        meta = pack.meta
+        note = "，另附总览图 %s" % os.path.basename(res["sheet"]) if res["sheet"] else ""
+        self.queue.put(("log",
+            "✅ %s  %s → %d 张二维码（%s，纠错 %s）%s\n   → 目录 %s" % (
+                name, _human(meta["size"]), len(frames), meta["codec"],
+                qr.DEFAULT_EC.upper(), note, res["dir"])))
+        if len(frames) > qr.MAX_SHEET_TILES:
+            self.queue.put(("log",
+                "   ⚠ 共 %d 帧未生成总览图（过多会降低识别率），请逐张传输" % len(frames)))
+        return res["images"]
 
     def _finish(self, info: dict):
         """一轮处理结束：日志汇总 + 明确的弹窗提示 + 输出位置。"""

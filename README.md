@@ -1,7 +1,8 @@
-# officepack — Office 文档 ⇄ 纯文本 无损装换
+# officepack — 任意文件 ⇄ 纯文本 无损装换
 
-把 `doc / docx / xls / xlsx / ppt / pptx`（或任意二进制文件）打包成一段**纯文本**，
-之后用这段文本 **100% 还原**出原文件 —— 还原后 SHA-256 与原文件逐字节一致。
+把**任意文件**（`doc/docx/xls/xlsx/ppt/pptx`、`pdf`、`zip/rar/7z`、`md/java/sql/py` 源码、
+图片、音视频……）打包成一段**纯文本**，之后用这段文本 **100% 还原**出原文件 ——
+还原后 SHA-256 与原文件逐字节一致。
 
 ```
 报表.docx ──打包──> 报表.docx.base91.opk.txt  （纯 ASCII 文本，可加密）
@@ -11,6 +12,24 @@
 > **不想自己构建？** 直接下打包好的 exe：
 > [**Releases（最新版）**](https://github.com/qq928820655/officepack/releases/latest)
 > —— 图形界面版（推荐）、单文件便携版、命令行版、应急修复包。
+
+## 支持哪些文件
+
+**结论：任意文件都能装。** 底层走的是「原始字节 → 压缩 → 加密 → 编码」，
+不解析文件内容，所以只要求「能读出来」，不要求「认得这个格式」。
+
+| 类别 | 扩展名 | 预览 |
+|---|---|---|
+| Office（OOXML） | `docx/docm/xlsx/xlsm/pptx/pptm` | 抽正文 |
+| Office（老二进制） | `doc/xls/ppt/msg` | 扫可打印串 |
+| PDF | `pdf` | 解 FlateDecode 流抽字符串 |
+| 压缩包 | `zip/jar/apk/war/whl/odt/epub…` | 列目录 + 条目数 |
+| 压缩包（无标准库） | `rar/7z/tar/gz/xz` | 仅类型标注 |
+| 源码 / 文本 | `md/java/sql/py/js/ts/go/rs/json/xml/yaml/ini/log…` | 按 UTF-8 → GBK 解码 |
+| 图片 | `png/jpg/bmp/gif/webp/tif` | 格式 + 像素尺寸 |
+| 音视频 / 可执行 / 未知 | `mp3/mp4/exe/dll/…`、任意扩展名 | 无（不影响还原） |
+
+预览只是**给人看的注释**，抽不出来（例如 `rar`、`mp4`）也完全不影响无损还原。
 
 ## 为什么不是「提取文字再还原」
 
@@ -101,9 +120,17 @@ officepack.exe unpack 报表.docx.cjk.opk.txt -o 输出目录 --password 123456
 ## 重新构建 exe
 
 ```bash
-build_exe.cmd            # 构建目录版（推荐）
+build_exe.cmd            # 构建目录版（推荐）：构建 → 自动瘦身
 build_exe.cmd portable   # 额外构建单文件便携版
 ```
+
+三步流水线，缺一不可：
+
+| 步骤 | 脚本 | 干什么 |
+|---|---|---|
+| 1 | `scripts/reset_dist.py` | 把旧产物挪进 `dist_prev/`（重名自动加序号）。**必须在构建前**，否则 PyInstaller 的 COLLECT 要删 1300 个文件，会被安全策略/杀软拦住，表现为「打印 Build complete 但产物是旧的」 |
+| 2 | `pyinstaller` | 分别构建 GUI / CLI 的目录版 |
+| 3 | `scripts/trim_dist.py` | 删掉确定用不到的运行时文件（见下） |
 
 > 构建前脚本会自动结束正在运行的 `OfficePack-GUI.exe` / `officepack.exe`——
 > 程序运行时 `dist` 里的 exe 和 dll 被系统独占，覆盖会失败。
@@ -112,6 +139,42 @@ build_exe.cmd portable   # 额外构建单文件便携版
 `OfficePack-GUI.exe --selftest`
 
 > 构建脚本固定使用 `C:\Python314\python.exe`——托管 Python 3.13 缺 tkinter 和 cryptography。
+
+### 瘦身：为了 60MB → 41MB
+
+`--collect-all PIL` 会把整个 Pillow 拖进来，其中大头是**完全用不到的编解码器**：
+
+| 删掉的 | 省 | 为什么可以删 |
+|---|---|---|
+| `PIL/_avif.pyd` | 7.5 MB | AVIF 编解码。二维码只出 PNG，扫码只碰 png/jpg/bmp/gif/webp |
+| `PIL/_imagingft.pyd` | 2.1 MB | FreeType 字体渲染。二维码是方块拼的，不写文字 |
+| `tkinterdnd2/tkdnd/` 11 个平台 | 1.3 MB | 只留 `win-x64`，osx/linux/arm 的拖拽库对本包无用 |
+| `PIL/_imagingcms.pyd` | 264 KB | LittleCMS 色彩管理，不做色彩空间转换 |
+| `_zstd.pyd` / `_decimal.pyd` | 776 KB | zstd 解压、十进制加速，本项目都不碰 |
+
+`_tcl_data/tzdata`（1.1MB）**故意保留**：它一个目录里 643 个文件，一次删光会撞上
+沙箱的批量删除保护，收益不值这个风险。
+
+> 瘦身是「锦上添花」，任何一项删失败都只警告、不让构建失败；
+> 删完必须跑 `scripts/verify_release.py` 证明功能没坏（它检查的就是被删文件没被依赖）。
+
+### 发布前功能验证
+
+```bash
+python scripts/verify_release.py            # 7 项，直接跑 dist 里的 exe
+python scripts/verify_release.py --no-gui   # 跳过 GUI 启窗检查（无桌面环境）
+```
+
+| 项 | 验什么 |
+|---|---|
+| 1 | 10 种文件（docx/pdf/zip/rar/md/java/sql/py/png/bin）打包 → 还原，SHA-256 逐个比对 |
+| 2 | 5 种编码器（base91/base32/cjk/hex/base64）都能往返 |
+| 3 | AES-256-GCM 加解密一致；**错误口令必须被拒** |
+| 4 | 分片 8 段**乱序**合并后仍逐字节一致 |
+| 5 | 二维码：`base32` 与 `base64` 各出一套 PNG，扫码还原后比对 SHA |
+| 6 | 瘦身删掉的文件确实没被 import 链依赖 |
+| 7 | GUI 能启动、窗口完整落在工作区内（高 DPI 下底部按钮不被裁） |
+
 
 
 
@@ -272,8 +335,18 @@ python -m officepack unpack 截图1.png 截图2.png
 | Q | 2,420 | 打印后拍照、折痕场景 |
 | H | 1,852 | 最耐污损，容量最小 |
 
-载荷固定用 `base32`（`A-Z` + `2-7`），正好落在字母数字模式里，1 字节只花 1.6 个字符；
-换成 base64（含小写字母）会掉回字节模式，**容量反而更小**，所以二维码通道会自动锁定 base32。
+载荷默认用 `base32`（`A-Z` + `2-7`），正好落在字母数字模式里，1 字节只花 1.6 个字符。
+
+**但不再限定 base32** —— 任意编码器都能出码，扫码后按容器 `Meta` 里记录的 codec 原样解码，
+所以「base91 生成 → 扫码还原」也能跑通。只是非字母数字编码器要多占空间：
+
+| 编码器 | 每字符占 bit | 相对 base32 的帧数 | 什么情况下值得用 |
+|---|---|---|---|
+| `base32` / `hex` | 5.5（字母数字模式） | 1.0× | 默认，帧数最少 |
+| `base91` / `base64` / `base85` / `custom` | 8.0（字节模式） | ≈1.4× | 想让文本本身更短、且不介意多几张码 |
+| `cjk` | 24.0（UTF-8 汉字） | ≈4.7× | 基本别用，字符数最少但二维码里最费 |
+
+图形界面在勾选「输出二维码」时会直接在日志里提示当前编码器要多占多少，不强制改选。
 
 按 L 级算，每帧净装约 2.6 KB（4,296 ÷ 1.6），扣掉段头与元信息后约 2.5 KB：
 
@@ -333,7 +406,8 @@ MZXW6YTBOI...
 - 依赖 `cryptography`（仅加密时需要），未安装时可用 `--cipher none`
 - 二维码通道每帧净装约 2.5 KB，**大文件会拆出很多帧**（60 KB 不可压缩数据 ≈ 24 张）；
   含图片的文档尤其明显。二维码适合几 KB ~ 几十 KB 的文件，更大的建议走文本通道
-- 二维码通道固定使用 `base32`，不能用 `cjk`（汉字码表不在二维码的可用字符集里）
+- 二维码通道**不再限定编码器**：`base91/base64/cjk` 都能出码，但会掉出「字母数字模式」，
+  同样内容要多占 1.4~4.7 倍帧数；想少出几张码就用 `base32` / `hex`
 
 ## 测试
 
@@ -341,6 +415,16 @@ MZXW6YTBOI...
 python -m unittest discover -s officepack/tests -v
 ```
 
-覆盖：5 种编码器 × 5 种压缩器 × 加密/非加密、空文件/1 字节/跨 1MiB 块边界、
-中文文件名、篡改检测、错误口令拒绝、文件级往返；二维码通道的分帧比特预算、
-单帧往返、多帧总览图、加密往返、缺帧定位、图片与文本混合还原。共 38 项。
+**65 项自动化测试**，分三个文件：
+
+| 文件 | 项数 | 覆盖 |
+|---|---|---|
+| `test_roundtrip.py` | 23 | 5 编码器 × 5 压缩器 × 加解密、空文件/1 字节/跨 1MiB 块、中文文件名、篡改检测、错误口令 |
+| `test_qr.py` | 17 | 分帧比特预算、任意编码器出帧与解码、单帧/多帧/总览图、缺帧定位、图片+文本混合还原 |
+| `test_anyfile.py` | 16 | 任意文件类型往返、PDF/ZIP/OLE2/未知二进制的预览抽取、预览截断、容器内的预览区 |
+| `test_gui_layout.py` | 9 | 2 行 2 列几何对齐、两列等宽、底部按钮不被裁、二维码不再锁编码器、二维码与分片互斥 |
+
+界面测试是**问 Tk 要坐标**（`winfo_rooty` / `winfo_width`）而不是截图，
+所以在无桌面会话里也能跑；`test_bottom_buttons_not_clipped` 正是为老 bug「底部按钮被裁」立的桩。
+
+发布前还要跑一遍真实 exe：`python scripts/verify_release.py`（见上）。

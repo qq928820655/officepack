@@ -9,9 +9,11 @@
 
 容量（QR 40，字母数字模式）：
     L 4296 / M 3391 / Q 2420 / H 1852 字符
-这里按 L 取 4000 作默认上限，留出头部与 meta 行的余量。
-base32 的字符集是 A-Z2-7，正好落在字母数字模式里，所以每字节只花 1.6 个字符；
-换成 base64（含小写）会掉回字节模式，容量反而更小 —— 这是 QR 通道固定用 base32 的原因。
+
+编码器不限定。base32 / hex 的字符集是 A-Z 0-9，正好落在二维码的「字母数字模式」
+（5.5 bit/字符）里最省地方；base91 / base64 / cjk 等会掉进字节模式（8 bit/字符）
+甚至更高，能用，只是同样内容要多占一些帧。用哪个由容器 meta 记录，
+扫码后按 meta 里的 codec 原样解码 —— 所以任意编码器生成、任意编码器还原都成立。
 """
 
 from __future__ import annotations
@@ -31,13 +33,14 @@ QR_ALNUM_CAPACITY = {"L": 4296, "M": 3391, "Q": 2420, "H": 1852}
 DEFAULT_EC = "L"
 
 # 分帧按「比特」算而不是按「字符」算：
-# 载荷是 base32（字母数字模式 5.5 bit/字符），而头部与 Meta 行含 # : 等符号，
-# 只能走字节模式（8 bit/字符）。只数字符的话，首帧带了 Meta 就会悄悄超容量。
-_BITS_ALNUM = 5.5
-_BITS_BYTE = 8.0
+# 载荷里的字符落在哪种模式，决定了每个字符要花多少 bit，
+# 只数字符的话，首帧带了 Meta 就会悄悄超容量（qrcode 会报 version 41）。
+_BITS_ALNUM = 5.5    # 字母数字模式：A-Z 0-9 和 $%*+-./: 空格
+_BITS_BYTE = 8.0     # 字节模式：其余 ASCII
+_BITS_CJK = 24.0     # cjk 编码器输出汉字，UTF-8 下 3 字节/字
 _SEGMENT_OVERHEAD_BITS = 40   # 模式指示符 + 字符计数 + 终止符的余量
 
-#: 允许出现在二维码里的编码器（必须全是大写字母/数字）
+#: 落在二维码「字母数字模式」里的编码器（同样字符数能装更多）
 ALNUM_CODECS = ("base32", "hex")
 
 #: 总览图最多拼多少帧。再多图幅会大到几万像素，识别率反而下降
@@ -53,13 +56,30 @@ class QRError(ValueError):
 # --------------------------------------------------------------------------
 # 分帧
 # --------------------------------------------------------------------------
-def _payload_budget(ec: str, byte_overhead_chars: int) -> int:
-    """在给定纠错级别下，扣掉头部/Meta 的字节开销后，载荷最多能放几个 base32 字符。"""
+def bits_per_char(codec_name: str) -> float:
+    """该编码器产出的文本，在二维码里平均每个字符要占多少 bit。"""
+    name = (codec_name or "").lower()
+    if name in ALNUM_CODECS:
+        return _BITS_ALNUM
+    if name == "cjk":
+        return _BITS_CJK
+    return _BITS_BYTE
+
+
+def overhead_ratio(codec_name: str) -> float:
+    """相对 base32，这个编码器要多占多少二维码空间（1.0 = 一样，>1 = 更费）。"""
+    return bits_per_char(codec_name) / _BITS_ALNUM
+
+
+def _payload_budget(ec: str, byte_overhead_chars: int, codec_name: str) -> int:
+    """给定纠错级别与编码器，扣掉头部/Meta 的字节开销后，载荷最多能放几个字符。"""
     cap = QR_ALNUM_CAPACITY.get((ec or DEFAULT_EC).upper())
     if cap is None:
         raise QRError("未知纠错级别 %r，可用：L / M / Q / H" % ec)
-    bits = cap * _BITS_ALNUM - byte_overhead_chars * _BITS_BYTE - _SEGMENT_OVERHEAD_BITS
-    return int(bits // _BITS_ALNUM)
+    bits = (cap * _BITS_ALNUM
+            - byte_overhead_chars * _BITS_BYTE
+            - _SEGMENT_OVERHEAD_BITS)
+    return int(max(0.0, bits) // bits_per_char(codec_name))
 
 
 def build_frames(
@@ -71,14 +91,12 @@ def build_frames(
 
     第 1 帧额外带 Meta 行（Meta 只在首帧出现一次，省容量）。
     ``chars_per_frame`` 给了就再压一道，用于「宁可多几帧、每帧更好扫」的场合。
+
+    编码器不限定：base32 / hex 落在二维码的字母数字模式最省，
+    base91 / base64 / cjk 等也能用，只是每字符占的 bit 更多、帧数更多。
     """
     meta = pack.meta
     codec_name = meta.get("codec", "")
-    if codec_name not in ALNUM_CODECS:
-        raise QRError(
-            "二维码通道需要纯大写字母/数字的编码器（%s），当前是 %r。"
-            "请改用 base32。" % (" / ".join(ALNUM_CODECS), codec_name)
-        )
     ec = (ec or DEFAULT_EC).upper()
     if ec not in QR_ALNUM_CAPACITY:
         raise QRError("未知纠错级别 %r，可用：L / M / Q / H" % ec)
@@ -91,15 +109,15 @@ def build_frames(
     doc_id = meta["sha256"][:6]
     header = "#OPK1 %s 000/000 %s 0000000" % (doc_id, "AAAAA")
 
-    first_cap = _payload_budget(ec, len(header) + 1 + len(meta_line) + 1)
-    rest_cap = _payload_budget(ec, len(header) + 1)
+    first_cap = _payload_budget(ec, len(header) + 1 + len(meta_line) + 1, codec_name)
+    rest_cap = _payload_budget(ec, len(header) + 1, codec_name)
     if chars_per_frame > 0:
         first_cap = min(first_cap, chars_per_frame)
         rest_cap = min(rest_cap, chars_per_frame)
     if first_cap <= 16:
         raise QRError(
-            "二维码容量不足以放下元信息（纠错 %s 只剩 %d 字符），"
-            "请改用更低的纠错级别（L）或换用更小的文件" % (ec, first_cap)
+            "二维码容量不足以放下元信息（纠错 %s / 编码器 %s 只剩 %d 字符），"
+            "请改用更低的纠错级别（L）或 base32 编码器" % (ec, codec_name, first_cap)
         )
 
     chunks: list[str] = []

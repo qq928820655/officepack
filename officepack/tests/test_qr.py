@@ -52,10 +52,31 @@ class QRFramesTest(unittest.TestCase):
                 q.make(fit=True)   # 超容量会抛异常
                 self.assertLessEqual(q.version, 40)
 
-    def test_rejects_non_alnum_codec(self):
-        pack = self._pack(b"abc", codec_name="base91")
+    def test_any_codec_is_allowed(self):
+        """二维码不再锁 base32：任意编码器都能出帧，也要能原样解码还原。"""
+        raw = os.urandom(3 * 1024)
+        for codec_name in ("base32", "hex", "base91", "base64", "base85", "cjk"):
+            with self.subTest(codec=codec_name):
+                pack = self._pack(raw, codec_name=codec_name)
+                frames = qr.build_frames(pack)
+                self.assertEqual(frames[0].count(ct.META_PREFIX), 1)
+                with tempfile.TemporaryDirectory() as tmp:
+                    results = ct.unpack_texts(frames, tmp)
+                    with open(results[0][0], "rb") as fh:
+                        self.assertEqual(_sha(fh.read()), _sha(raw))
+
+    def test_alnum_codec_needs_fewer_frames(self):
+        """base32 / hex 落在字母数字模式，同样体积的帧数应少于字节模式编码器。"""
+        raw = os.urandom(16 * 1024)
+        alnum = qr.build_frames(self._pack(raw, codec_name="base32"))
+        byte_mode = qr.build_frames(self._pack(raw, codec_name="base64"))
+        self.assertLess(len(alnum), len(byte_mode))
+        self.assertGreater(qr.overhead_ratio("base64"), 1.0)
+        self.assertAlmostEqual(qr.overhead_ratio("base32"), 1.0)
+
+    def test_rejects_unknown_ec_level(self):
         with self.assertRaises(qr.QRError):
-            qr.build_frames(pack)
+            qr.build_frames(self._pack(b"abc"), ec="Z")
 
     def test_chars_per_frame_override(self):
         raw = os.urandom(8 * 1024)

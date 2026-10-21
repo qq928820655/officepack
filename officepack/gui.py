@@ -16,6 +16,7 @@ from . import container as ct
 from . import codecs as codec_mod
 from . import compress as compress_mod
 from . import crypto as crypto_mod
+from . import preview as preview_mod
 from . import qr
 
 try:  # 拖拽支持为可选项
@@ -25,10 +26,17 @@ try:  # 拖拽支持为可选项
 except Exception:  # pragma: no cover
     _HAS_DND = False
 
-APP_TITLE = "officepack — Office 文档 ↔ 纯文本"
-OFFICE_EXTS = (".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm",
-               ".ppt", ".pptx", ".pptm", ".rtf", ".odt", ".pdf")
-TEXT_EXTS = (".txt", ".opk") + qr.IMAGE_EXTS   # 还原时可选的：文本容器 + 二维码图片
+APP_TITLE = "officepack — 任意文件 ↔ 纯文本"
+
+#: 打包（文件 → 文本）其实**任意文件都能进**，这里只是给对话框分组、给表格标类型。
+#: 列表来自 preview.py，两边共用一套定义，避免两处各写一份还写歪。
+OFFICE_EXTS = preview_mod.OOXML_EXTS + preview_mod.OLE2_EXTS + (".rtf", ".odt", ".ods", ".odp")
+DOC_EXTS = preview_mod.TEXT_EXTS + preview_mod.PDF_EXTS
+PKG_EXTS = preview_mod.ZIP_EXTS + preview_mod.ARCHIVE_EXTS
+MEDIA_EXTS = preview_mod.IMAGE_EXTS + preview_mod.MEDIA_EXTS
+
+#: 还原（文本 → 文件）能吃的：文本容器 + 二维码图片
+TEXT_EXTS = (".txt", ".opk") + qr.IMAGE_EXTS
 
 # 每个参数的说明：(标题, 一句话说明, [(选项名, 详细作用)])
 # 显示时会把「当前选中的选项」高亮出来，方便对照
@@ -170,10 +178,11 @@ class App:
 
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=14, pady=(12, 4))
-        ttk.Label(header, text="Office 文档 ↔ 纯文本 无损装换", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(header, text="任意文件 ↔ 纯文本 无损装换", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="文档 → 文本编码载体（可加密）；还原后与原文件 SHA-256 完全一致",
+            text="Word / Excel / PPT / PDF / 压缩包 / 源码 / 图片……任意文件 → 文本编码载体（可加密）；"
+                 "还原后与原文件 SHA-256 完全一致",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -233,15 +242,17 @@ class App:
 
         self.mode = tk.StringVar(value="pack")
         ttk.Label(right, text="操作模式").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Radiobutton(right, text="打包（文档 → 文本）", variable=self.mode,
+        ttk.Radiobutton(right, text="打包（文件 → 文本）", variable=self.mode,
                         value="pack").grid(row=1, column=0, sticky="w", padx=10)
-        ttk.Radiobutton(right, text="还原（文本 → 文档）", variable=self.mode,
+        ttk.Radiobutton(right, text="还原（文本 → 文件）", variable=self.mode,
                         value="unpack").grid(row=2, column=0, sticky="w", padx=10)
 
         self.preset = tk.StringVar(value="chars")
         self.codec = tk.StringVar(value=ct.PRESETS["chars"]["codec"])
         self.compress = tk.StringVar(value=ct.PRESETS["chars"]["compress"])
         self.cipher = tk.StringVar(value="none")
+        self.password = tk.StringVar()
+        self.show_pwd = tk.BooleanVar(value=False)
 
         self._param_label(right, 3, "预设", "preset")
         preset_box = ttk.Combobox(right, textvariable=self.preset, width=22, state="readonly",
@@ -252,44 +263,27 @@ class App:
         preset_box.set("chars（字数最少）")
         preset_box.bind("<<ComboboxSelected>>", self._on_preset)
 
-        self._param_label(right, 5, "编码器", "codec")
-        self.codec_box = ttk.Combobox(right, textvariable=self.codec, width=22, state="readonly",
-                                      values=list(codec_mod.CODECS))
-        self.codec_box.grid(row=6, column=0, sticky="ew", padx=10)
+        # 编码器 / 压缩器的下拉项都很短，并成一行两列，省下的高度留给日志
+        self._param_pair(right, 5, [
+            ("编码器", "codec", self._build_codec),
+            ("压缩器", "compress", self._build_compress),
+        ])
+        self._param_pair(right, 6, [
+            ("加密器", "cipher", self._build_cipher),
+            ("口令", "password", self._build_password),
+        ])
 
-        self._param_label(right, 7, "压缩器", "compress")
-        ttk.Combobox(right, textvariable=self.compress, width=22, state="readonly",
-                     values=["auto", "lzma", "zlib", "bz2", "none"]).grid(
-            row=8, column=0, sticky="ew", padx=10)
-
-        self._param_label(right, 9, "加密器", "cipher")
-        ttk.Combobox(right, textvariable=self.cipher, width=22, state="readonly",
-                     values=["none", "aes-256-gcm"]).grid(row=10, column=0, sticky="ew", padx=10)
-
-        self._param_label(right, 11, "口令", "password")
-        self.password = tk.StringVar()
-        pwd_row = ttk.Frame(right)
-        pwd_row.grid(row=12, column=0, sticky="ew", padx=10)
-        entry = ttk.Entry(pwd_row, textvariable=self.password, width=14, show="●")
-        entry.pack(side="left", fill="x", expand=True)
-
-        # 「显示口令」贴在输入框右侧，单独占一行会白白多吃 30px 垂直空间
-        self.show_pwd = tk.BooleanVar(value=False)
-        ttk.Checkbutton(pwd_row, text="显示", variable=self.show_pwd,
-                        command=lambda: entry.configure(show="" if self.show_pwd.get() else "●")
-                        ).pack(side="left", padx=(6, 0))
-
-        self._param_label(right, 14, "输出目录", "outdir")
+        self._param_label(right, 9, "输出目录", "outdir")
         self.out_dir = tk.StringVar(value="")
         out_row = ttk.Frame(right)
-        out_row.grid(row=15, column=0, sticky="ew", padx=10)
+        out_row.grid(row=10, column=0, sticky="ew", padx=10)
         ttk.Entry(out_row, textvariable=self.out_dir, width=16).pack(side="left", fill="x", expand=True)
         ttk.Button(out_row, text="…", width=3, command=self.pick_out_dir).pack(side="left", padx=(4, 0))
 
-        self._param_label(right, 16, "分片输出", "split")
+        self._param_label(right, 11, "分片输出", "split")
         self.split_enabled = tk.BooleanVar(value=False)
         seg_row = ttk.Frame(right)
-        seg_row.grid(row=17, column=0, sticky="ew", padx=10)
+        seg_row.grid(row=12, column=0, sticky="ew", padx=10)
         self.split_chk = ttk.Checkbutton(seg_row, text="启用", variable=self.split_enabled,
                                          command=self._on_split_toggle)
         self.split_chk.pack(side="left")
@@ -299,30 +293,30 @@ class App:
         ttk.Label(seg_row, text="字/段").pack(side="left")
 
         # 二维码输出（与分片互斥：二维码有自己的分帧规则）
-        self._param_label(right, 18, "输出二维码", "qr")
+        self._param_label(right, 13, "输出二维码", "qr")
         self.qr_enabled = tk.BooleanVar(value=False)
         qr_row = ttk.Frame(right)
-        qr_row.grid(row=19, column=0, sticky="ew", padx=10)
+        qr_row.grid(row=14, column=0, sticky="ew", padx=10)
         self.qr_chk = ttk.Checkbutton(qr_row, text="生成图片", variable=self.qr_enabled,
                                       command=self._on_qr_toggle)
         self.qr_chk.pack(side="left")
         ttk.Label(qr_row, text="每帧一张 PNG", style="Hint.TLabel").pack(side="left", padx=(8, 0))
 
         self.go = ttk.Button(right, text="开始处理", style="Go.TButton", command=self.start)
-        self.go.grid(row=20, column=0, sticky="ew", padx=10, pady=(12, 3))
+        self.go.grid(row=15, column=0, sticky="ew", padx=10, pady=(12, 3))
 
         self.open_btn = ttk.Button(right, text="打开输出文件夹", command=self.open_out_dir)
-        self.open_btn.grid(row=21, column=0, sticky="ew", padx=10, pady=(0, 3))
+        self.open_btn.grid(row=16, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.paste_btn = ttk.Button(right, text="粘贴文本还原…", command=self.paste_unpack)
-        self.paste_btn.grid(row=22, column=0, sticky="ew", padx=10, pady=(0, 3))
+        self.paste_btn.grid(row=17, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.shot_btn = ttk.Button(right, text="截图还原（二维码）…", command=self.qr_unpack)
-        self.shot_btn.grid(row=23, column=0, sticky="ew", padx=10, pady=(0, 3))
+        self.shot_btn.grid(row=18, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.help_btn = ttk.Button(right, text="全部参数说明…",
                                    command=lambda: self._show_help(None))
-        self.help_btn.grid(row=24, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self.help_btn.grid(row=19, column=0, sticky="ew", padx=10, pady=(0, 8))
 
         self._on_split_toggle()
         try:
@@ -484,15 +478,23 @@ class App:
         self._add(list(paths))
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(
-            title="选择文件",
-            filetypes=[
-                ("全部支持的", " ".join("*" + e for e in OFFICE_EXTS + TEXT_EXTS)),
+        """按当前模式给不同分组：打包什么都收，还原只收容器/图片。"""
+        if self.mode.get() == "pack":
+            everything = OFFICE_EXTS + DOC_EXTS + PKG_EXTS + MEDIA_EXTS
+            groups = [
+                ("全部支持的文件", " ".join("*" + e for e in everything)),
                 ("Office 文档", " ".join("*" + e for e in OFFICE_EXTS)),
+                ("文本 / 源码 / PDF", " ".join("*" + e for e in DOC_EXTS)),
+                ("压缩包", " ".join("*" + e for e in PKG_EXTS)),
+                ("图片 / 音视频", " ".join("*" + e for e in MEDIA_EXTS)),
+                ("所有文件（任意扩展名都能打包）", "*.*"),
+            ]
+        else:
+            groups = [
                 ("文本容器 / 二维码图片", " ".join("*" + e for e in TEXT_EXTS)),
                 ("所有文件", "*.*"),
-            ],
-        )
+            ]
+        paths = filedialog.askopenfilenames(title="选择文件", filetypes=groups)
         if paths:
             self._add(list(paths))
 
@@ -508,14 +510,12 @@ class App:
     def _refresh_row(self, path: str):
         size = os.path.getsize(path)
         ext = os.path.splitext(path)[1].lower()
-        if ext in OFFICE_EXTS:
-            info = "Office 文档"
-        elif ext in qr.IMAGE_EXTS:
-            info = "二维码图片"
+        if ext in qr.IMAGE_EXTS:
+            info = "图片 / 二维码"
         elif ext in TEXT_EXTS:
             info = "文本容器"
         else:
-            info = "其他二进制"
+            info = preview_mod.kind_of(ext)
         if self.tree.exists(path):
             self.tree.item(path, values=(os.path.basename(path), _human(size), info))
         else:
@@ -739,7 +739,7 @@ class App:
             pass
 
     def _on_qr_toggle(self):
-        """二维码与分片互斥：二维码自带分帧，编码器也必须换成 base32。"""
+        """二维码与分片互斥（二维码自带分帧）；编码器不锁，随便选。"""
         pack = self.mode.get() == "pack"
         on = self.qr_enabled.get() and pack
         # 分片开关让位（还原模式下本来就不可用）
@@ -749,13 +749,21 @@ class App:
             pass
         if on:
             self.split_enabled.set(False)
-            # 纯大写字母+数字才能命中二维码的字母数字模式
-            self.codec.set(qr.QR_CODEC)
-        try:
-            self.codec_box.configure(state="disabled" if on else "readonly")
-        except tk.TclError:
-            pass
         self._on_split_toggle()
+        self._qr_hint()
+
+    def _qr_hint(self):
+        """勾了二维码时，在日志区提示当前编码器在二维码里多费多少空间。"""
+        if not (self.qr_enabled.get() and self.mode.get() == "pack"):
+            return
+        name = (self.codec.get() or "").lower()
+        ratio = qr.overhead_ratio(name)
+        if ratio <= 1.0001:
+            return
+        self._log(
+            "· 二维码通道：编码器 %s 不落在字母数字模式，每帧约少装 %.0f%% 的内容"
+            "（多出约 %.1f 倍帧数）。想少几张码就切 base32 / hex。"
+            % (name or "?", (1 - 1 / ratio) * 100, ratio))
 
     def _sync_mode(self):
         """切换打包/还原时联动分片、二维码开关的可用状态。"""
@@ -771,6 +779,55 @@ class App:
         self._on_qr_toggle()
 
     # ---------------- 参数说明 ----------------
+    def _param_pair(self, parent, row, items):
+        """一行两列的参数组：短下拉项并排，省下的高度留给日志。
+
+        每项 = (标题, 帮助key, 构建函数)；构建函数负责把控件塞进自己的小格子里。
+        """
+        box = ttk.Frame(parent)
+        box.grid(row=row, column=0, sticky="ew", padx=10, pady=(2, 4))
+        box.columnconfigure(0, weight=1, uniform="pair")
+        box.columnconfigure(1, weight=1, uniform="pair")
+        for idx, (text, key, build) in enumerate(items):
+            cell = ttk.Frame(box)
+            cell.grid(row=0, column=idx, sticky="ew",
+                      padx=(0, 5) if idx == 0 else (5, 0))
+            head = ttk.Frame(cell)
+            head.pack(fill="x")
+            ttk.Label(head, text=text).pack(side="left")
+            mark = ttk.Label(head, text="?", foreground="#0a58ca", cursor="hand2")
+            mark.pack(side="left", padx=(3, 0))
+            mark.bind("<Button-1>", lambda _e, k=key: self._show_help(k))
+            build(cell)
+        return box
+
+    def _build_codec(self, cell):
+        self.codec_box = ttk.Combobox(cell, textvariable=self.codec, width=9,
+                                      state="readonly", values=list(codec_mod.CODECS))
+        self.codec_box.pack(fill="x")
+
+    def _build_compress(self, cell):
+        self.compress_box = ttk.Combobox(cell, textvariable=self.compress, width=9,
+                                         state="readonly",
+                                         values=["auto", "lzma", "zlib", "bz2", "none"])
+        self.compress_box.pack(fill="x")
+
+    def _build_cipher(self, cell):
+        self.cipher_box = ttk.Combobox(cell, textvariable=self.cipher, width=9,
+                                       state="readonly",
+                                       values=["none", "aes-256-gcm"])
+        self.cipher_box.pack(fill="x")
+
+    def _build_password(self, cell):
+        row = ttk.Frame(cell)
+        row.pack(fill="x")
+        self.pwd_entry = ttk.Entry(row, textvariable=self.password, width=6, show="●")
+        self.pwd_entry.pack(side="left", fill="x", expand=True)
+        ttk.Checkbutton(row, text="显示", variable=self.show_pwd,
+                        command=lambda: self.pwd_entry.configure(
+                            show="" if self.show_pwd.get() else "●")
+                        ).pack(side="left", padx=(4, 0))
+
     def _param_label(self, parent, row, text, key):
         """参数名 + 可点击的 ? 说明入口。"""
         box = ttk.Frame(parent)
@@ -920,7 +977,7 @@ class App:
             try:
                 if as_qr:
                     paths = self._pack_one_qr(src, name, out_dir, password, cipher,
-                                              compress_mode, outputs)
+                                              compress_mode, codec_name, outputs)
                     ok += 1
                     continue
 
@@ -953,12 +1010,13 @@ class App:
         self.queue.put(("done", {"ok": ok, "fail": len(files) - ok,
                                  "outputs": outputs, "errors": errors}))
 
-    def _pack_one_qr(self, src, name, out_dir, password, cipher, compress_mode, outputs):
-        """单个文件走二维码通道；返回写出的图片路径。"""
+    def _pack_one_qr(self, src, name, out_dir, password, cipher, compress_mode,
+                     codec_name, outputs):
+        """单个文件走二维码通道；返回写出的图片路径。编码器沿用界面选择。"""
         with open(src, "rb") as fh:
             raw = fh.read()
         pack = ct.pack_bytes(
-            raw, name, codec_name=qr.QR_CODEC,
+            raw, name, codec_name=codec_name,
             cipher_name=cipher, password=password,
             compress=compress_mode, preview=False, ascii_only=True,
         )

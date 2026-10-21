@@ -167,9 +167,9 @@ def cmd_pack(args) -> int:
 def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, out_dir) -> int:
     """二维码通道：一帧一张 PNG，扫码工具（AirScan-QR / 鹊桥 / 手机相机）都能读。"""
     if codec_name not in qr.ALNUM_CODECS:
-        print("· 二维码通道需要纯大写字母数字，已自动把编码器 %s 换成 %s"
-              % (codec_name, qr.QR_CODEC))
-        codec_name = qr.QR_CODEC
+        factor = qr.bits_per_char(codec_name) / qr._BITS_ALNUM
+        print("· 编码器 %s 不落在二维码的字母数字模式，同样数据要多占约 %.1f 倍空间；"
+              "想少几张码可加 --codec base32" % (codec_name, factor))
 
     failed = 0
     for src in args.files:
@@ -372,11 +372,12 @@ def cmd_gui(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="officepack",
-        description="Office 文档二进制 ↔ 纯文本无损装换（还原后 SHA-256 完全一致）",
+        description="任意文件 ↔ 纯文本无损装换：Word/Excel/PPT/PDF/压缩包/源码/图片都能装（还原后 SHA-256 完全一致）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
             "  officepack pack 报表.docx --preset compact --password 123456\n"
+            "  officepack pack 代码.zip 说明.pdf --codec base32   # 任意文件都能装\n"
             "  officepack pack 报表.docx --qr              # 输出二维码图片\n"
             "  officepack unpack 报表.docx.base91.opk.txt --password 123456\n"
             "  officepack unpack 截图.png                  # 从二维码截图还原\n"
@@ -388,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_pack_opts(p):
         p.add_argument("--preset", choices=list(ct.PRESETS), help="一键预设")
-        p.add_argument("--codec", help="编码器：base91/base85/base64/base32/hex/custom")
+        p.add_argument("--codec", help="编码器：base91/base85/base64/base32/hex/cjk/custom")
         p.add_argument("--alphabet", help="custom 编码器的 64 字符码表")
         p.add_argument("--compress", help="压缩器：auto/lzma/zlib/bz2/none")
         p.add_argument("--level", type=int, help="压缩级别")
@@ -410,11 +411,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--parts", type=int, default=0, metavar="K",
                        help="切成 K 段（尽量均分）")
 
-    p_pack = sub.add_parser("pack", help="文档 → 文本 / 二维码")
+    p_pack = sub.add_parser("pack", help="文件 → 文本 / 二维码")
     p_pack.add_argument("files", nargs="+")
     p_pack.add_argument("-o", "--out-dir", help="输出目录")
     p_pack.add_argument("--qr", action="store_true",
-                        help="改为输出二维码图片：一帧一张 PNG，可用 AirScan-QR / 鹊桥 / 手机相机传递")
+                        help="改为输出二维码图片：一帧一张 PNG，可用 AirScan-QR / 鹊桥 / 手机相机传递；"
+                             "编码器用 base32 最省帧，其他编码器也能用")
     p_pack.add_argument("--qr-ec", choices=["L", "M", "Q", "H"], default=qr.DEFAULT_EC,
                         help="二维码纠错级别（默认 %s）：L 容量最大，H 最耐脏污" % qr.DEFAULT_EC)
     p_pack.add_argument("--qr-chars", type=int, default=0, metavar="N",

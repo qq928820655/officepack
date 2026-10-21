@@ -46,7 +46,7 @@ from .compress import compress as compress_bytes
 from .crypto import CryptoError, make_cipher
 from .preview import extract_preview
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 __all__ = [
     "BEGIN",

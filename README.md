@@ -9,7 +9,7 @@
 ```
 
 > **不想自己构建？** 直接下打包好的 exe：
-> [**Releases · v1.0.0**](https://github.com/qq928820655/officepack/releases/tag/v1.0.0)
+> [**Releases（最新版）**](https://github.com/qq928820655/officepack/releases/latest)
 > —— 图形界面版（推荐）、单文件便携版、命令行版、应急修复包。
 
 ## 为什么不是「提取文字再还原」

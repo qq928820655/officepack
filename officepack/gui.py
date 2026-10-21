@@ -129,13 +129,17 @@ class App:
         self.queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.last_out_dir: str | None = None   # 上一轮实际写出文件的目录
+        self._log_lines = 6                    # 日志框行数，屏幕不够时会被自动压缩
+        self._poll_id: str | None = None       # 队列轮询的 after id
 
         root.title(APP_TITLE)
-        root.geometry("980x660")
-        root.minsize(860, 580)
 
         self._build_style()
         self._build_ui()
+        # 布局建完才知道内容真实需要多大：不能写死 geometry，
+        # 否则在 125%/150% 缩放的屏幕上底部按钮会被裁掉。
+        self._fit_window()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_queue()
 
     # ---------------- UI ----------------
@@ -150,7 +154,7 @@ class App:
         style.configure("Go.TButton", font=("Microsoft YaHei UI", 10, "bold"))
 
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+        pad = {"padx": 10, "pady": 3}
 
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=14, pady=(12, 4))
@@ -235,13 +239,16 @@ class App:
 
         self._param_label(right, 11, "口令", "password")
         self.password = tk.StringVar()
-        entry = ttk.Entry(right, textvariable=self.password, width=24, show="●")
-        entry.grid(row=12, column=0, sticky="ew", padx=10)
+        pwd_row = ttk.Frame(right)
+        pwd_row.grid(row=12, column=0, sticky="ew", padx=10)
+        entry = ttk.Entry(pwd_row, textvariable=self.password, width=14, show="●")
+        entry.pack(side="left", fill="x", expand=True)
 
+        # 「显示口令」贴在输入框右侧，单独占一行会白白多吃 30px 垂直空间
         self.show_pwd = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="显示口令", variable=self.show_pwd,
+        ttk.Checkbutton(pwd_row, text="显示", variable=self.show_pwd,
                         command=lambda: entry.configure(show="" if self.show_pwd.get() else "●")
-                        ).grid(row=13, column=0, sticky="w", padx=10)
+                        ).pack(side="left", padx=(6, 0))
 
         self._param_label(right, 14, "输出目录", "outdir")
         self.out_dir = tk.StringVar(value="")
@@ -263,17 +270,17 @@ class App:
         ttk.Label(seg_row, text="字/段").pack(side="left")
 
         self.go = ttk.Button(right, text="开始处理", style="Go.TButton", command=self.start)
-        self.go.grid(row=18, column=0, sticky="ew", padx=10, pady=(16, 4))
+        self.go.grid(row=18, column=0, sticky="ew", padx=10, pady=(12, 3))
 
         self.open_btn = ttk.Button(right, text="打开输出文件夹", command=self.open_out_dir)
-        self.open_btn.grid(row=19, column=0, sticky="ew", padx=10, pady=(0, 4))
+        self.open_btn.grid(row=19, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.paste_btn = ttk.Button(right, text="粘贴文本还原…", command=self.paste_unpack)
-        self.paste_btn.grid(row=20, column=0, sticky="ew", padx=10, pady=(0, 4))
+        self.paste_btn.grid(row=20, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.help_btn = ttk.Button(right, text="全部参数说明…",
                                    command=lambda: self._show_help(None))
-        self.help_btn.grid(row=21, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.help_btn.grid(row=21, column=0, sticky="ew", padx=10, pady=(0, 8))
 
         self._on_split_toggle()
         try:
@@ -285,10 +292,56 @@ class App:
         bottom = ttk.LabelFrame(self.root, text="日志")
         bottom.pack(fill="both", padx=10, pady=(4, 10))
         self.progress = ttk.Progressbar(bottom, mode="determinate")
-        self.progress.pack(fill="x", padx=8, pady=(8, 4))
-        self.log = tk.Text(bottom, height=8, wrap="none", font=("Consolas", 9),
+        self.progress.pack(fill="x", padx=8, pady=(6, 4))
+        self.log = tk.Text(bottom, height=self._log_lines, wrap="none", font=("Consolas", 9),
                            bg="#fbfbfb", relief="flat", state="disabled")
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    # ---------------- 窗口尺寸 ----------------
+    def _size_dialog(self, dlg, want_w, want_h, min_w, min_h):
+        """对话框同样不能写死像素：按屏幕可用范围收窄，并居中到主窗口。"""
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        w = min(want_w, max(min_w, screen_w - 60))
+        h = min(want_h, max(min_h, screen_h - 120))
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - w) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - h) // 3)
+        dlg.geometry("%dx%d+%d+%d" % (w, h, max(0, x), max(0, y)))
+        dlg.minsize(min(min_w, w), min(min_h, h))
+
+    def _fit_window(self):
+        """按内容实测尺寸决定窗口大小，而不是写死像素。
+
+        Tk 的 px 是物理像素，而字体大小会随系统缩放（125%/150%）放大，
+        所以同一个 "980x660" 在高缩放屏幕上装不下内容，底部按钮会被裁掉。
+        这里先让 Tk 算出内容真正需要的尺寸，再钳制到屏幕可用范围内；
+        真的放不下时优先牺牲最不关键的日志框高度。
+        """
+        self.root.update_idletasks()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        # 预留标题栏 + 任务栏
+        limit_w = max(720, screen_w - 40)
+        limit_h = max(520, screen_h - 90)
+
+        req_w = self.root.winfo_reqwidth()
+        req_h = self.root.winfo_reqheight()
+
+        # 日志框从 6 行往下退，退到 2 行还不够就放弃（极端小屏）
+        while req_h > limit_h and self._log_lines > 2:
+            self._log_lines -= 1
+            self.log.configure(height=self._log_lines)
+            self.root.update_idletasks()
+            req_h = self.root.winfo_reqheight()
+
+        w = min(max(req_w, 880), limit_w)
+        h = min(req_h, limit_h)
+
+        x = max(0, (screen_w - w) // 2)
+        y = max(0, (screen_h - h) // 2 - 24)
+        self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        # 下限就用算出来的尺寸：再缩小一定会切掉控件
+        self.root.minsize(w, h)
 
     # ---------------- 文件管理 ----------------
     def _on_drop(self, event):
@@ -357,8 +410,7 @@ class App:
         """手动粘贴容器文本还原：完整容器、单个分片、多个分片混在一起都支持。"""
         dlg = tk.Toplevel(self.root)
         dlg.title("粘贴文本还原")
-        dlg.geometry("840x580")
-        dlg.minsize(620, 420)
+        self._size_dialog(dlg, 840, 580, 620, 420)
         dlg.transient(self.root)
         try:
             dlg.grab_set()
@@ -493,7 +545,7 @@ class App:
     def _param_label(self, parent, row, text, key):
         """参数名 + 可点击的 ? 说明入口。"""
         box = ttk.Frame(parent)
-        box.grid(row=row, column=0, sticky="w", padx=10, pady=6)
+        box.grid(row=row, column=0, sticky="w", padx=10, pady=2)
         ttk.Label(box, text=text).pack(side="left")
         mark = ttk.Label(box, text="?", foreground="#0a58ca", cursor="hand2")
         mark.pack(side="left", padx=(4, 0))
@@ -519,8 +571,7 @@ class App:
         """弹出参数说明；key=None 时列出全部。当前选中的选项会高亮。"""
         dlg = tk.Toplevel(self.root)
         dlg.title("参数说明" if key is None else "参数说明 · " + HELP[key][0])
-        dlg.geometry("820x600")
-        dlg.minsize(520, 360)
+        self._size_dialog(dlg, 820, 600, 520, 360)
         dlg.transient(self.root)
 
         wrap = ttk.Frame(dlg)
@@ -711,7 +762,17 @@ class App:
                     self._finish(payload)
         except queue.Empty:
             pass
-        self.root.after(120, self._poll_queue)
+        self._poll_id = self.root.after(120, self._poll_queue)
+
+    def _on_close(self):
+        """窗口关闭时取消挂起的 after，否则 Tk 会抛 invalid command name。"""
+        if self._poll_id is not None:
+            try:
+                self.root.after_cancel(self._poll_id)
+            except tk.TclError:
+                pass
+            self._poll_id = None
+        self.root.destroy()
 
 
 def main() -> int:

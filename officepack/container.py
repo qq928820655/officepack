@@ -44,6 +44,7 @@ DEFAULT_COMPRESS = "auto"
 
 # 预设：一行搞定「体积」和「兼容性」的取舍
 PRESETS = {
+    "qr": {"codec": "qr45", "compress": "max"},           # 单张二维码装最多（1.5 字符/字节）
     "chars": {"codec": "cjk", "compress": "max"},         # 字符数最少（万分之级目标）
     "compact": {"codec": "base91", "compress": "auto"},   # ASCII 体积最小
     "safe": {"codec": "base32", "compress": "auto"},      # 纯大写+数字，最耐复制
@@ -162,9 +163,7 @@ def render(pack: PackResult) -> str:
     encoded = codec.encode(pack.payload)
     meta["text_chars"] = len(encoded)
 
-    meta_b64 = base64.b64encode(
-        json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).decode("ascii")
+    meta_b64 = _meta_b64(meta)
 
     name_shown = meta["name"]
     preview = pack.preview
@@ -288,9 +287,27 @@ def _crc91(text: str) -> str:
 
 
 def _meta_b64(meta: dict) -> str:
-    return base64.b64encode(
-        json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).decode("ascii")
+    """把 meta 序列化成一行 base64。
+
+    能压小就压小：JSON 里 ``sha256``、``salt``、``nonce`` 这些字段压缩率很高，
+    zlib 后通常只剩原文的 55~70%。压缩版用一个 `~` 打头（不在 base64 字母表里），
+    解码端据此区分 —— 所以 Meta 行前缀、分段解析全都不用改，老文本照样能读。
+
+    meta 省下的每个字符，在二维码里都是一张码能多装的字节（首帧曾为它让出 640 字符）。
+    """
+    raw = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    plain = base64.b64encode(raw).decode("ascii")
+    packed = base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+    return "~" + packed if len(packed) + 1 < len(plain) else plain
+
+
+def _meta_decode(meta_b64: str) -> dict:
+    """还原 ``_meta_b64`` 的两种写法（明文 / ``~`` 打头的压缩版）。"""
+    if meta_b64.startswith("~"):
+        raw = zlib.decompress(base64.b64decode(meta_b64[1:].encode("ascii")))
+    else:
+        raw = base64.b64decode(meta_b64.encode("ascii"))
+    return json.loads(raw.decode("utf-8"))
 
 
 def _segment_count(total: int, budget: int, meta_len: int) -> int:
@@ -432,24 +449,36 @@ def join_segments(segs: list[Segment]) -> str:
     if any(s.total != total for s in segs):
         raise ContainerError("各段声明的总段数不一致，可能来自不同次打包")
 
+    # 先用 CRC 把「扫花了」的帧筛掉，再判断重复。
+    # 这样同一张码扫了两遍（其中一遍截断/糊了）不会把整次还原拖死 ——
+    # 逐帧 CRC 正是为此存在的：坏帧丢弃，好帧照样拼得回去。
+    broken = [s for s in segs if _crc91(s.body) != s.crc]
+    intact = [s for s in segs if _crc91(s.body) == s.crc]
+
     by_index: dict[int, Segment] = {}
-    for seg in segs:
-        if seg.index in by_index:
-            raise ContainerError("第 %d 段重复出现" % seg.index)
-        if _crc91(seg.body) != seg.crc:
+    for seg in intact:
+        first = by_index.get(seg.index)
+        if first is None:
+            by_index[seg.index] = seg
+        elif first.body != seg.body:
             raise ContainerError(
-                "第 %d/%d 段校验失败：内容被截断、改写或多粘了字符" % (seg.index, total)
+                "第 %d 段出现了两份不同内容（可能是两次打包混在一起）" % seg.index
             )
-        by_index[seg.index] = seg
+        # 内容完全相同的重复帧直接忽略：多扫几遍是无害的
 
     missing = [i for i in range(1, total + 1) if i not in by_index]
     if missing:
+        hint = ""
+        if broken:
+            bad = sorted({s.index for s in broken})
+            hint = "；另有第 %s 段校验失败（扫歪/截断），重扫这几张即可" % "、".join(
+                str(i) for i in bad)
         raise ContainerError(
-            "缺少第 %s 段（共需 %d 段，已收到 %d 段）"
-            % ("、".join(str(i) for i in missing), total, len(by_index))
+            "缺少第 %s 段（共需 %d 段，已收到 %d 段）%s"
+            % ("、".join(str(i) for i in missing), total, len(by_index), hint)
         )
 
-    meta_line = next((s.meta_line for s in segs if s.meta_line), None)
+    meta_line = next((s.meta_line for s in intact if s.meta_line), None)
     if not meta_line:
         raise ContainerError("未找到 Meta 行，第 1 段可能缺失或已损坏")
 
@@ -492,7 +521,7 @@ def read_container(text: str) -> tuple[dict, str]:
         raise ContainerError("容器不完整：缺少结束标记（文本可能被截断）")
 
     try:
-        meta = json.loads(base64.b64decode(meta_b64.encode("ascii")).decode("utf-8"))
+        meta = _meta_decode(meta_b64)
     except Exception as exc:
         raise ContainerError("Meta 解析失败：%s" % exc) from None
     if meta.get("v") != VERSION:
@@ -669,13 +698,7 @@ def inspect_text(text: str) -> dict:
             for seg in segs:
                 if seg.meta_line:
                     try:
-                        out.update(
-                            json.loads(
-                                base64.b64decode(
-                                    seg.meta_line[len(META_PREFIX) :].encode("ascii")
-                                ).decode("utf-8")
-                            )
-                        )
+                        out.update(_meta_decode(seg.meta_line[len(META_PREFIX):]))
                     except Exception:
                         pass
                     break

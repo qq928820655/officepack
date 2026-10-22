@@ -229,6 +229,43 @@ def test_qr(srcdir: str, samples: dict[str, bytes]) -> str:
     return "、".join(notes) + " 扫回一致"
 
 
+def test_qr_preset_and_gif(srcdir: str, samples: dict[str, bytes]) -> str:
+    """qr 预设（qr45+max）与 GIF 动图：动图丢回去能逐帧读全并还原。"""
+    outdir = os.path.join(OUT, "qr_gif")
+    _fresh(outdir)
+    # 必须拿压不动的数据：README.md 压缩后 < 2.4KB 只会出 1 帧，而单帧不生成动图
+    import random
+    rnd = random.Random(20261022)
+    big = os.path.join(srcdir, "big.blob")
+    with open(big, "wb") as fh:
+        fh.write(bytes(rnd.getrandbits(8) for _ in range(9000)))
+    run_cli(["pack", big, "-o", outdir, "--qr", "--preset", "qr", "--qr-gif", "3"])
+    gifs = [n for n in os.listdir(outdir) if n.lower().endswith(".gif")]
+    if not gifs:
+        raise RuntimeError("没有生成 GIF 动图")
+    pngs = [n for n in os.listdir(outdir)
+            if n.lower().endswith(".png") and "all" not in n.lower()]
+    gif_path = os.path.join(outdir, gifs[0])
+
+    # 帧数必须与单帧 PNG 数一致（一帧一张 PNG）
+    import struct
+    with open(gif_path, "rb") as fh:
+        raw = fh.read()
+    gif_frames = raw.count(b"\x21\xf9\x04")     # 图形控制扩展 = 每帧一个
+    if gif_frames != len(pngs):
+        raise RuntimeError("GIF 帧数 %d ≠ PNG 张数 %d" % (gif_frames, len(pngs)))
+
+    restored_dir = outdir + "_restored"
+    _fresh(restored_dir)
+    run_cli(["unpack", gif_path, "-o", restored_dir])
+    got = os.listdir(restored_dir)
+    with open(big, "rb") as fh:
+        want = sha(fh.read())
+    if not got or sha_file(os.path.join(restored_dir, got[0])) != want:
+        raise RuntimeError("GIF 逐帧还原后内容不一致")
+    return "qr 预设 %d 帧 → GIF 往返一致" % gif_frames
+
+
 def test_trimmed_bundle_intact() -> str:
     """瘦身删掉的文件不能是被 import 链依赖的 —— 用真实 exe 反证。"""
     import glob
@@ -360,11 +397,14 @@ def main() -> int:
     print("\n[5] 二维码（任意编码器）")
     check("二维码出图 → 扫码还原", test_qr, srcdir, samples)
 
-    print("\n[6] 瘦身完整性")
+    print("\n[6] 二维码 qr 预设 + 动图")
+    check("qr45 出码 → GIF 逐帧还原", test_qr_preset_and_gif, srcdir, samples)
+
+    print("\n[7] 瘦身完整性")
     check("精简后功能仍然正常", test_trimmed_bundle_intact)
 
     if "--no-gui" not in sys.argv:
-        print("\n[7] 图形界面")
+        print("\n[8] 图形界面")
         if os.path.isfile(GUI):
             check("GUI 启动 / 窗口完整显示", test_gui)
         else:

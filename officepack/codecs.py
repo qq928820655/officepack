@@ -171,6 +171,70 @@ class Base32Codec(Codec):
         return out[:total_len]
 
 
+_QR45_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$%*+-./:"
+_QR45_REVERSE = {ch: i for i, ch in enumerate(_QR45_ALPHABET)}
+
+
+class Qr45Codec(Codec):
+    """    二维码字母数字模式专用：2 字节 → 3 字符（1.5 字符/字节）。
+
+    思路来自 RFC 9285 的 Base45，但**去掉了字母表里的空格**（44 个字符），
+    所以与 RFC 9285 不是字节级兼容——原因很实际：Base45 把空格当有效字符，
+    而分段文本折行后行首行尾的空格会被 ``strip()`` 吃掉，一解码就错位。
+    44³ = 85184 > 65536，表示 2 字节绰绰有余，编码效率与 Base45 完全相同。
+
+    比 base32（1.6 字符/字节）少占 6.7%，且字符全落在二维码的
+    字母数字模式（5.5 bit/字符）里，是单张 QR 能装最多数据的通用编码。
+    """
+
+    name = "qr45"
+    expansion = 1.5
+
+    def encode(self, data: bytes) -> str:
+        table = _QR45_ALPHABET
+        out: list[str] = []
+        pairs = len(data) - (len(data) & 1)
+        for i in range(0, pairs, 2):
+            n = data[i] * 256 + data[i + 1]
+            out.append(table[n % 44])
+            n //= 44
+            out.append(table[n % 44])
+            out.append(table[n // 44])
+        if len(data) & 1:                       # 末尾单字节 → 2 字符
+            a = data[-1]
+            out.append(table[a % 44])
+            out.append(table[a // 44])
+        return "".join(out)
+
+    def decode(self, text: str, total_len: int) -> bytes:
+        text = _clean(text)
+        try:
+            vals = [_QR45_REVERSE[ch] for ch in text]
+        except KeyError as exc:
+            raise CodecError("qr45 含非法字符：%r" % exc.args[0]) from None
+        if len(vals) % 3 == 1:
+            raise CodecError("qr45 文本长度非法（%d 字符，可能被截断）" % len(vals))
+
+        out = bytearray()
+        for pos in range(0, len(vals) - 2, 3):
+            n = vals[pos] + vals[pos + 1] * 44 + vals[pos + 2] * 1936
+            if n > 0xFFFF:
+                raise CodecError("qr45 数据块越界，文本可能被改写")
+            out.append(n >> 8)
+            out.append(n & 0xFF)
+        pos = (len(vals) // 3) * 3
+        if pos < len(vals):                     # 末尾 2 字符 = 1 字节
+            n = vals[pos] + vals[pos + 1] * 44
+            if n > 0xFF:
+                raise CodecError("qr45 尾部字符越界，文本可能被改写")
+            out.append(n)
+        if len(out) < total_len:
+            raise CodecError(
+                "解码长度不足：期望 %d 字节，实际 %d" % (total_len, len(out))
+            )
+        return bytes(out[:total_len])
+
+
 class HexCodec(Codec):
     name = "hex"
     expansion = 2.0
@@ -321,6 +385,7 @@ CODECS: dict[str, type[Codec]] = {
     Base85Codec.name: Base85Codec,
     Base64Codec.name: Base64Codec,
     Base32Codec.name: Base32Codec,
+    Qr45Codec.name: Qr45Codec,
     HexCodec.name: HexCodec,
     CustomCodec.name: CustomCodec,
     CjkCodec.name: CjkCodec,

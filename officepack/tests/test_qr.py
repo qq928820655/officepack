@@ -140,13 +140,22 @@ class QRImageRoundTripTest(unittest.TestCase):
         with open(results[0][0], "rb") as fh:
             self.assertEqual(_sha(fh.read()), _sha(raw))
 
-    def test_too_many_frames_skips_sheet(self):
+    def test_too_many_frames_pages_the_sheet(self):
+        """帧数超过一页时不再放弃总览图，而是分页 —— 19 帧 = 2 张图。"""
         raw = os.urandom(48 * 1024)
         frames = qr.build_frames(self._pack_bytes(raw), ec="L")
         self.assertGreater(len(frames), qr.MAX_SHEET_TILES)
         res = qr.render_images(frames, self.tmp, "大.bin", ec="L", sheet=True)
-        self.assertIsNone(res["sheet"])
         self.assertEqual(len(res["images"]), len(frames))
+        expect_pages = -(-len(frames) // qr.MAX_SHEET_TILES)
+        self.assertEqual(len(res["sheets"]), expect_pages)
+        self.assertEqual(res["sheet"], res["sheets"][0])
+
+        # 逐页扫码，拼起来必须是完整的帧集合（顺序无关）
+        texts = []
+        for page in res["sheets"]:
+            texts.extend(qr.decode_images([page]))
+        self.assertEqual(sorted(texts), sorted(frames))
 
     def test_encrypted_qr_roundtrip(self):
         raw = os.urandom(4 * 1024)

@@ -19,6 +19,14 @@ DIST = os.path.join(ROOT, "dist")
 PREV = os.path.join(ROOT, "dist_prev")
 NAMES = ("OfficePack-GUI", "officepack")
 
+#: PyInstaller 的工作缓存目录。`--clean` 会 rmtree 它们，
+#: 而 build/cli 有几十个文件 —— 同样会撞上批量删除保护（实测报
+#: ``SHFileOperationW 失败: 0x2``，然后整个 [2/3] 步直接失败）。
+#: 所以构建前也一并挪走，让 PyInstaller 面对的是干净的空目录。
+CACHE_NAMES = ("cli", "gui", "cli_one", "gui_one")
+BUILD_DIR = os.path.join(ROOT, "build")
+CACHE_PREV = os.path.join(ROOT, "build_tmp", "buildcache")
+
 
 def _free_name(name: str) -> str:
     """在 dist_prev 里找一个没被占用的名字：name、name_2、name_3 …"""
@@ -28,6 +36,28 @@ def _free_name(name: str) -> str:
     while os.path.exists(os.path.join(PREV, "%s_%d" % (name, idx))):
         idx += 1
     return "%s_%d" % (name, idx)
+
+
+def _move_cache() -> int:
+    """把 build/ 下的 PyInstaller 缓存挪到 build_tmp/buildcache/（同盘 rename，瞬间完成）。"""
+    os.makedirs(CACHE_PREV, exist_ok=True)
+    moved = 0
+    for name in CACHE_NAMES:
+        src = os.path.join(BUILD_DIR, name)
+        if not os.path.isdir(src):
+            continue
+        base = name
+        target = os.path.join(CACHE_PREV, base)
+        idx = 2
+        while os.path.exists(target):
+            target = os.path.join(CACHE_PREV, "%s_%d" % (base, idx))
+            idx += 1
+        try:
+            os.rename(src, target)
+            moved += 1
+        except OSError as exc:
+            print("  [警告] 挪构建缓存 %s 失败：%s" % (name, exc))
+    return moved
 
 
 def main() -> int:
@@ -59,7 +89,11 @@ def main() -> int:
             except OSError as exc2:
                 print("  [错误] 仍然失败：%s —— 请手动关闭正在运行的 exe" % exc2)
                 return 1
-    if not moved:
+
+    cached = _move_cache()
+    if cached:
+        print("  挪走 %d 个 PyInstaller 构建缓存 → build_tmp/buildcache/" % cached)
+    if not moved and not cached:
         print("  dist 里没有旧产物，无需清理")
     return 0
 

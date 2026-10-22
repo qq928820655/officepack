@@ -41,7 +41,7 @@ _BITS_CJK = 24.0     # cjk 编码器输出汉字，UTF-8 下 3 字节/字
 _SEGMENT_OVERHEAD_BITS = 40   # 模式指示符 + 字符计数 + 终止符的余量
 
 #: 落在二维码「字母数字模式」里的编码器（同样字符数能装更多）
-ALNUM_CODECS = ("base32", "hex")
+ALNUM_CODECS = ("qr45", "base32", "hex")
 
 #: 总览图最多拼多少帧。再多图幅会大到几万像素，识别率反而下降
 MAX_SHEET_TILES = 12
@@ -69,6 +69,37 @@ def bits_per_char(codec_name: str) -> float:
 def overhead_ratio(codec_name: str) -> float:
     """相对 base32，这个编码器要多占多少二维码空间（1.0 = 一样，>1 = 更费）。"""
     return bits_per_char(codec_name) / _BITS_ALNUM
+
+
+def single_frame_bytes(ec: str = DEFAULT_EC, codec_name: str = QR_CODEC,
+                       meta_chars: int = 360) -> int:
+    """单张二维码最多能装多少**压缩后字节**（首帧要带 Meta，按典型长度扣减）。
+
+    物理上限：QR 40 版字母数字模式 4296 字符 × 5.5 bit ÷ 8 = 2953 字节。
+    qr45 是 1.5 字符/字节，再扣掉段头和 meta（压缩后约 360 字符，走字节模式 8 bit/字符），
+    实测不加密约 2.5KB、加密约 2.35KB —— 这就是「一张码搞定」的天花板。
+    ``meta_chars=0`` 可取不含元信息的上限（后续帧的真实容量）。
+    """
+    head = len("#OPK1 abcdef 001/001 AAAAA 0000000")
+    chars = _payload_budget(ec, head + 1 + meta_chars, codec_name)
+    return int(chars / codec_mod.get_codec(codec_name).expansion)
+
+
+def capacity_report(pack: ct.PackResult, ec: str = DEFAULT_EC) -> dict:
+    """给界面用的一句话容量体检：装得下几张码、卡在哪。"""
+    codec_name = (pack.meta or {}).get("codec", QR_CODEC)
+    frames = build_frames(pack, ec)
+    room = single_frame_bytes(ec, codec_name)
+    payload = len(pack.payload)
+    return {
+        "frames": len(frames),
+        "payload_bytes": payload,
+        "single_frame_bytes": room,
+        "codec": codec_name,
+        "ec": ec,
+        "fits_single": len(frames) == 1,
+        "over_ratio": round(payload / room, 2) if room else 0.0,
+    }
 
 
 def _payload_budget(ec: str, byte_overhead_chars: int, codec_name: str) -> int:
@@ -179,6 +210,39 @@ def _make_qr_image(text: str, ec: str, target_px: int = 960):
     return qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
 
+def render_gif(
+    frames: Sequence[str],
+    out_path: str,
+    ec: str = DEFAULT_EC,
+    fps: float = 3.0,
+    target_px: int = 720,
+) -> str:
+    """把多帧合成一张**循环播放的 GIF**：手机对着屏幕录像/扫码就能一次收全。
+
+    为什么 GIF 不吃亏：二维码只有黑白两色，GIF 的 256 色调色板对它**完全无损**，
+    再用 LZW 压缩，一张 720px 的黑白码通常只有 8~15KB —— 与同分辨率 PNG 相当。
+    真正省体积靠的是 ``target_px``（每模块 3px 就够扫，无需 5px）。
+
+    帧率别贪高：手机相机对焦+解码要 150ms 以上，``fps`` 取 2~4 最稳。
+    """
+    from PIL import Image
+
+    if not frames:
+        raise QRError("没有可渲染的帧")
+    if len(frames) == 1:
+        raise QRError("只有一帧，用静态图就够了，不需要动图")
+    fps = max(0.5, min(10.0, float(fps)))
+    duration = int(round(1000.0 / fps))
+
+    images = [_make_qr_image(f, ec, target_px).convert("P", palette=Image.ADAPTIVE, colors=2)
+              for f in frames]
+    images[0].save(
+        out_path, "GIF", save_all=True, append_images=images[1:],
+        duration=duration, loop=0, optimize=True, disposal=2,
+    )
+    return out_path
+
+
 def render_images(
     frames: Sequence[str],
     out_dir: str,
@@ -187,12 +251,12 @@ def render_images(
     sheet: bool = True,
     target_px: int = 960,
 ) -> dict:
-    """把每帧写成一张 PNG，可选再拼一张总览图。
+    """把每帧写成一张 PNG，可选再拼总览图（多帧自动分页，每页 12 张）。
 
-    帧数超过 MAX_SHEET_TILES 时不拼总览图：几十张码拼到一起会有上万像素，
-    扫起来反而更容易漏（实测 125 帧的 11700×11000 总览图会丢帧）。
+    单页塞太多码会有上万像素，扫起来反而容易漏（实测 125 帧的 11700×11000
+    总览图会丢帧），所以按每页 12 张分页 —— 19 帧就是 2 张总览图，截两次图搞定。
 
-    返回 ``{"images": [...], "sheet": 路径或 None, "dir": 目录}``。
+    返回 ``{"images": [...], "sheet": 首页或 None, "sheets": [...], "dir": 目录}``。
     """
     if not frames:
         raise QRError("没有可渲染的帧")
@@ -208,19 +272,29 @@ def render_images(
         images.append(path)
         tiles.append((idx, img))
 
-    sheet_path = None
-    if sheet and 1 < total <= MAX_SHEET_TILES:
-        sheet_path = os.path.join(out_dir, "%s.qr-all.png" % stem)
-        _make_sheet(tiles, total, sheet_path, ec)
-    return {"images": images, "sheet": sheet_path, "dir": out_dir}
+    sheets: list[str] = []
+    if sheet and total > 1:
+        # 分页拼图：一页 12 张。19 帧 → 2 页总览，截两次图就够，
+        # 比逐张传 19 次好太多；单页再大就会到上万像素，识别率反而掉。
+        pages = [tiles[i:i + MAX_SHEET_TILES]
+                 for i in range(0, total, MAX_SHEET_TILES)]
+        for pi, page in enumerate(pages, 1):
+            name = ("%s.qr-all.png" % stem if len(pages) == 1
+                    else "%s.qr-all%d.png" % (stem, pi))
+            path = os.path.join(out_dir, name)
+            _make_sheet(page, total, path, ec)
+            sheets.append(path)
+    return {"images": images, "sheet": sheets[0] if sheets else None,
+            "sheets": sheets, "dir": out_dir}
 
 
 def _make_sheet(tiles, total: int, path: str, ec: str) -> None:
-    """把所有帧拼成一张总览图：一行截图就能把全部帧带回来。"""
+    """把一页帧拼成一张总览图：一行截图就能把这一页全部带回来。"""
     from PIL import Image, ImageDraw, ImageFont
 
-    cols = max(1, int(math.ceil(math.sqrt(total))))
-    rows = int(math.ceil(total / cols))
+    count = len(tiles)
+    cols = max(1, int(math.ceil(math.sqrt(count))))
+    rows = int(math.ceil(count / cols))
     cell = max(im.width for _, im in tiles)
     pad = 16
     label_h = 34
@@ -229,20 +303,29 @@ def _make_sheet(tiles, total: int, path: str, ec: str) -> None:
     height = rows * (cell + label_h) + pad * (rows + 1)
     sheet = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(sheet)
+    # 字体是**可选**的：瘦身版删掉了 FreeType（_imagingft.pyd，2.1MB），
+    # 这时 truetype 会抛 ImportError 而 load_default 仍可用；
+    # 万一连默认字体都没有，就干脆不画序号标签 —— 顺序本来就无关紧要。
+    font = None
     try:
         font = ImageFont.truetype("arial.ttf", 22)
-    except (OSError, IOError):
-        font = ImageFont.load_default()
+    except Exception:  # noqa: BLE001  缺 FreeType / 缺字体文件
+        try:
+            font = ImageFont.load_default()
+        except Exception:  # noqa: BLE001
+            font = None
 
     for i, (idx, im) in enumerate(tiles):
         r, c = divmod(i, cols)
         x = pad + c * (cell + pad) + (cell - im.width) // 2
         y = pad + r * (cell + label_h + pad)
         sheet.paste(im, (x, y))
+        if font is None:
+            continue
         label = "%d / %d" % (idx, total)
         try:
             tw = int(draw.textlength(label, font=font))
-        except AttributeError:  # 老 Pillow
+        except Exception:  # noqa: BLE001  老 Pillow / 位图字体无 textlength
             tw = 6 * len(label)
         draw.text((x + (im.width - tw) // 2, y + im.height + 4), label,
                   fill="black", font=font)
@@ -298,18 +381,47 @@ def unpack_any(
 
 
 def decode_image(image) -> list[str]:
-    """识别单张图里的所有二维码；可传路径、PIL 图或 numpy 数组。"""
+    """识别单张图里的所有二维码；可传路径、PIL 图或 numpy 数组。
+
+    多帧图（GIF / 动图 PNG / TIFF）会**逐帧**识别 —— 所以一段动态二维码
+    存成 gif 后，直接把它丢进来就能收全所有帧，不用逐帧截图。
+    """
     import zxingcpp
-    from PIL import Image
+    from PIL import Image, ImageSequence
 
     if isinstance(image, str):
-        img = Image.open(image)
-    else:
-        img = image
-
-    if not hasattr(img, "mode"):        # numpy 数组之类，交给 zxing 自己处理
-        results = zxingcpp.read_barcodes(img)
+        with Image.open(image) as img:      # 一定要 close：动图会占着文件句柄
+            return _decode_frames(img)
+    if not hasattr(image, "mode"):        # numpy 数组之类，交给 zxing 自己处理
+        results = zxingcpp.read_barcodes(image)
         return [r.text for r in results if r.text]
+    return _decode_frames(image)
+
+
+def _decode_frames(img) -> list[str]:
+    """逐帧识别一张图（静态图就是走一帧）。"""
+    from PIL import ImageSequence
+
+    texts: list[str] = []
+    for frame in ImageSequence.Iterator(img):
+        texts.extend(_read_one(frame))
+    return _dedup(texts)
+
+
+def _dedup(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for t in items:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _read_one(img) -> list[str]:
+    """识别一张（单帧）图里的所有码。"""
+    import zxingcpp
+    from PIL import Image
 
     if img.mode not in ("L", "RGB"):
         img = img.convert("RGB")

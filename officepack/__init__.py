@@ -52,16 +52,19 @@ from .qr import (
     QR_CODEC,
     QRError,
     build_frames,
+    capacity_report,
     decode_image,
     decode_images,
     inspect_images,
     is_image_path,
     overhead_ratio,
+    render_gif,
     render_images,
+    single_frame_bytes,
     unpack_images,
 )
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     "BEGIN",
@@ -107,9 +110,12 @@ __all__ = [
     "DEFAULT_EC",
     "ALNUM_CODECS",
     "overhead_ratio",
+    "single_frame_bytes",
+    "capacity_report",
     "QRError",
     "build_frames",
     "render_images",
+    "render_gif",
     "decode_images",
     "decode_image",
     "unpack_images",

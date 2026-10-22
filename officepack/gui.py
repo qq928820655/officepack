@@ -120,13 +120,23 @@ HELP: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
     ),
     "qr": (
         "输出二维码",
-        "不生成文本，改为每帧一张二维码 PNG，适合走扫码通道（AirScan-QR / 鹊桥 / 手机相机）传文件。",
+        "不生成文本，改为输出二维码图片，适合走扫码通道（AirScan-QR / 鹊桥 / 手机相机）传文件。",
         [
             ("off", "不勾选：按文本输出（.opk.txt）。"),
-            ("on", "勾选后输出二维码图片：一张码装不下时会自动拆成多帧，文件名带 001/002 序号；"
-                   "帧数不多时另附一张总览图，截一次屏就能把全部帧带回来。"
-                   "编码器会自动锁定为 base32 —— 纯大写字母数字才能命中二维码的紧凑模式。"),
-            ("back", "还原时把截图直接粘进来点「截图还原…」，或把 PNG 拖进列表，程序会自己扫码。"),
+            ("on", "勾选后输出二维码：一张码装不下时自动拆成多帧，文件名带 001/002 序号。\n"
+                   "单张码的上限是固定的（QR 40 版、纠错 L、qr45 编码器）——\n"
+                   "压缩后约 2.4KB；超过就必然是多张，这是二维码标准的物理上限。"),
+            ("PNG（单帧 + 总览）", "每帧一张 PNG，另附总览图（每页 12 帧，多页自动续）。\n"
+                                  "总览图一张就能把整页帧全带回来，电脑上还原最快。"),
+            ("GIF 动图", "把全部帧合成一张循环播放的动图，适合手机对着屏幕扫。\n"
+                        "二维码只有黑白两色，GIF 对它是**完全无损**的，数据不会掉；\n"
+                        "体积约等于同样分辨率的 PNG（黑白图没法靠帧间压缩再省）。\n"
+                        "帧率别贪高：相机对焦+解码要 150ms 以上，2~4 帧/秒最稳。"),
+            ("PNG + GIF", "两种都出。先拿总览图在电脑上还原；手机端用动图。" ),
+            ("帧/秒", "动图播放速度。太快手机跟不上会更漏帧，太慢要等太久；3 最好用。"),
+            ("back", "还原：点「还原二维码 → 框选屏幕区域」，拖框圈住码，松开就识别；\n"
+                     "也可以读剪贴板截图、选图片文件，或直接把 PNG/GIF 拖进列表。\n"
+                     "顺序无关：每帧都带序号和校验，扫到哪帧收哪帧。"),
         ],
     ),
 }
@@ -256,7 +266,8 @@ class App:
 
         self._param_label(right, 3, "预设", "preset")
         preset_box = ttk.Combobox(right, textvariable=self.preset, width=22, state="readonly",
-                                  values=["chars（字数最少）", "compact（ASCII 体积最小）",
+                                  values=["qr（单张码装最多）", "chars（字数最少）",
+                                          "compact（ASCII 体积最小）",
                                           "safe（纯大写+数字，耐复制）",
                                           "fast（速度快）", "plain（不压缩）", "自定义"])
         preset_box.grid(row=4, column=0, sticky="ew", padx=10)
@@ -295,12 +306,20 @@ class App:
         # 二维码输出（与分片互斥：二维码有自己的分帧规则）
         self._param_label(right, 13, "输出二维码", "qr")
         self.qr_enabled = tk.BooleanVar(value=False)
+        self.qr_format = tk.StringVar(value="PNG（单帧 + 总览）")
+        self.qr_fps = tk.StringVar(value="3")
         qr_row = ttk.Frame(right)
         qr_row.grid(row=14, column=0, sticky="ew", padx=10)
-        self.qr_chk = ttk.Checkbutton(qr_row, text="生成图片", variable=self.qr_enabled,
+        self.qr_chk = ttk.Checkbutton(qr_row, text="生成", variable=self.qr_enabled,
                                       command=self._on_qr_toggle)
         self.qr_chk.pack(side="left")
-        ttk.Label(qr_row, text="每帧一张 PNG", style="Hint.TLabel").pack(side="left", padx=(8, 0))
+        self.qr_fmt_box = ttk.Combobox(qr_row, textvariable=self.qr_format, width=17,
+                                       state="readonly",
+                                       values=["PNG（单帧 + 总览）", "GIF 动图",
+                                               "PNG + GIF"])
+        self.qr_fmt_box.pack(side="left", padx=(8, 0))
+        ttk.Entry(qr_row, textvariable=self.qr_fps, width=3).pack(side="left", padx=(6, 0))
+        ttk.Label(qr_row, text="帧/秒", style="Hint.TLabel").pack(side="left", padx=(3, 0))
 
         self.go = ttk.Button(right, text="开始处理", style="Go.TButton", command=self.start)
         self.go.grid(row=15, column=0, sticky="ew", padx=10, pady=(12, 3))
@@ -311,7 +330,13 @@ class App:
         self.paste_btn = ttk.Button(right, text="粘贴文本还原…", command=self.paste_unpack)
         self.paste_btn.grid(row=17, column=0, sticky="ew", padx=10, pady=(0, 3))
 
-        self.shot_btn = ttk.Button(right, text="截图还原（二维码）…", command=self.qr_unpack)
+        self.shot_btn = ttk.Menubutton(right, text="还原二维码 ▾")
+        shot_menu = tk.Menu(self.shot_btn, tearoff=False)
+        shot_menu.add_command(label="框选屏幕区域…（推荐）", command=self.grab_region)
+        shot_menu.add_command(label="读取剪贴板截图", command=self.qr_unpack)
+        shot_menu.add_command(label="选择图片文件…",
+                              command=lambda: self.qr_unpack(from_file=True))
+        self.shot_btn["menu"] = shot_menu
         self.shot_btn.grid(row=18, column=0, sticky="ew", padx=10, pady=(0, 3))
 
         self.help_btn = ttk.Button(right, text="全部参数说明…",
@@ -661,21 +686,107 @@ class App:
         box.focus_set()
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
 
-    def qr_unpack(self):
+    def grab_region(self):
+        """全屏框选一块区域 → 截图 → 识别二维码 → 直接还原。
+
+        比「先截图存文件再选文件」少两步：屏幕上有码，拖一个框就完事。
+        多屏时只框当前屏幕（Tk 的 winfo_screenwidth 是主屏尺寸）。
+        """
+        try:
+            from PIL import ImageGrab
+        except Exception as exc:  # 没有 Pillow
+            messagebox.showerror(APP_TITLE, "缺少 Pillow，无法截图：%s" % exc)
+            return
+
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        try:
+            top.attributes("-alpha", 0.30)      # 半透明遮罩，能看见底下的码
+        except tk.TclError:
+            pass
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        top.geometry("%dx%d+0+0" % (sw, sh))
+        top.configure(bg="black")
+
+        canvas = tk.Canvas(top, bg="black", highlightthickness=0, cursor="cross")
+        canvas.pack(fill="both", expand=True)
+        canvas.create_text(sw // 2, 40, fill="white", font=("Microsoft YaHei UI", 14),
+                           text="拖框圈住二维码 · 松开即识别 · Esc 取消")
+
+        box = {"x0": 0, "y0": 0, "rect": None}
+
+        def on_press(e):
+            box["x0"], box["y0"] = e.x, e.y
+            box["rect"] = canvas.create_rectangle(e.x, e.y, e.x, e.y,
+                                                  outline="#ff3b30", width=2)
+
+        def on_drag(e):
+            if box["rect"] is not None:
+                canvas.coords(box["rect"], box["x0"], box["y0"], e.x, e.y)
+
+        def on_release(e):
+            x1, x2 = sorted((box["x0"], e.x))
+            y1, y2 = sorted((box["y0"], e.y))
+            ox, oy = canvas.winfo_rootx(), canvas.winfo_rooty()
+            top.destroy()
+            if x2 - x1 < 24 or y2 - y1 < 24:      # 误点一下，当取消
+                return
+            self.root.configure(cursor="watch")
+            self.root.update_idletasks()
+            try:
+                img = ImageGrab.grab(bbox=(ox + x1, oy + y1, ox + x2, oy + y2),
+                                     all_screens=True)
+                self._unpack_qr_image(img, "屏幕框选")
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror(APP_TITLE, "框选识别失败：\n%s" % exc)
+                self._log("✗ 框选识别失败：%s" % exc)
+            finally:
+                self.root.configure(cursor="")
+                self.root.update_idletasks()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        top.bind("<Escape>", lambda _e: top.destroy())
+        top.focus_force()
+
+    def _unpack_qr_image(self, img, source: str):
+        """把一张 PIL 图里的二维码全部识别出来并还原。"""
+        texts = qr.decode_image(img)
+        if not texts:
+            raise qr.QRError("这块区域里没有识别到完整的二维码。\n"
+                             "请把码整个圈进去，别切掉边角，也别缩得太小。")
+        password = self.password.get() or None
+        out_dir = self.out_dir.get().strip() or None
+        results = ct.unpack_texts(texts, out_dir, password)
+        self.last_out_dir = os.path.dirname(results[0][0])
+        names = "、".join(os.path.basename(p) for p, _ in results[:5])
+        self._log("✅ 从%s识别 %d 帧 → 还原 %d 个文件：%s"
+                  % (source, len(texts), len(results), names))
+        if messagebox.askyesno(
+            APP_TITLE,
+            "已从%s还原 %d 个文件\n\n%s\n\n打开所在文件夹？"
+            % (source, len(results), self.last_out_dir),
+        ):
+            self.open_out_dir()
+
+    def qr_unpack(self, from_file: bool = False):
         """从截图还原：优先读剪贴板里的截图，取不到再让人选图片文件。"""
         paths: list[str] = []
         inline = None
-        try:
-            from PIL import ImageGrab
+        if not from_file:
+            try:
+                from PIL import ImageGrab
 
-            clip = ImageGrab.grabclipboard()
-        except Exception:  # 没有 Pillow / 剪贴板读不到
-            clip = None
+                clip = ImageGrab.grabclipboard()
+            except Exception:  # 没有 Pillow / 剪贴板读不到
+                clip = None
 
-        if isinstance(clip, list):
-            paths = [p for p in clip if qr.is_image_path(p)]
-        elif clip is not None:
-            inline = clip          # 剪贴板里直接就是一张图
+            if isinstance(clip, list):
+                paths = [p for p in clip if qr.is_image_path(p)]
+            elif clip is not None:
+                inline = clip          # 剪贴板里直接就是一张图
 
         if inline is None and not paths:
             chosen = filedialog.askopenfilenames(
@@ -762,7 +873,7 @@ class App:
             return
         self._log(
             "· 二维码通道：编码器 %s 不落在字母数字模式，每帧约少装 %.0f%% 的内容"
-            "（多出约 %.1f 倍帧数）。想少几张码就切 base32 / hex。"
+            "（多出约 %.1f 倍帧数）。想少几张码就选预设 qr（qr45 + max）。"
             % (name or "?", (1 - 1 / ratio) * 100, ratio))
 
     def _sync_mode(self):
@@ -937,13 +1048,14 @@ class App:
             target=self._run,
             args=(mode, files, out_dir, password, cipher,
                   self.codec.get(), self.compress.get(), segment,
-                  self.qr_enabled.get() and mode == "pack"),
+                  self.qr_enabled.get() and mode == "pack",
+                  self.qr_format.get(), self.qr_fps.get()),
             daemon=True,
         )
         self.worker.start()
 
     def _run(self, mode, files, out_dir, password, cipher, codec_name, compress_mode,
-             segment, as_qr=False):
+             segment, as_qr=False, qr_format="PNG（单帧 + 总览）", qr_fps="3"):
         ok = 0
         outputs: list[str] = []
         errors: list[str] = []
@@ -977,7 +1089,8 @@ class App:
             try:
                 if as_qr:
                     paths = self._pack_one_qr(src, name, out_dir, password, cipher,
-                                              compress_mode, codec_name, outputs)
+                                              compress_mode, codec_name, outputs,
+                                              qr_format, qr_fps)
                     ok += 1
                     continue
 
@@ -1011,7 +1124,7 @@ class App:
                                  "outputs": outputs, "errors": errors}))
 
     def _pack_one_qr(self, src, name, out_dir, password, cipher, compress_mode,
-                     codec_name, outputs):
+                     codec_name, outputs, qr_format="PNG（单帧 + 总览）", qr_fps="3"):
         """单个文件走二维码通道；返回写出的图片路径。编码器沿用界面选择。"""
         with open(src, "rb") as fh:
             raw = fh.read()
@@ -1022,18 +1135,52 @@ class App:
         )
         frames = qr.build_frames(pack, ec=qr.DEFAULT_EC)
         target_dir = out_dir or os.path.dirname(os.path.abspath(src))
-        res = qr.render_images(frames, target_dir, name, ec=qr.DEFAULT_EC, sheet=True)
-        outputs.extend(res["images"])
+        want_png = qr_format.startswith("PNG") or "+" in qr_format
+        want_gif = "GIF" in qr_format and len(frames) > 1
+
+        res = {"images": [], "sheet": None, "sheets": [], "dir": target_dir}
+        if want_png:
+            res = qr.render_images(frames, target_dir, name, ec=qr.DEFAULT_EC, sheet=True)
+            outputs.extend(res["images"])
+            outputs.extend(res.get("sheets") or [])
+
+        gif_path = None
+        if want_gif:
+            try:
+                fps = float(qr_fps)
+            except (TypeError, ValueError):
+                fps = 3.0
+            gif_path = os.path.join(target_dir, "%s.qr.gif" % name)
+            qr.render_gif(frames, gif_path, ec=qr.DEFAULT_EC, fps=fps)
+            outputs.append(gif_path)
 
         meta = pack.meta
-        note = "，另附总览图 %s" % os.path.basename(res["sheet"]) if res["sheet"] else ""
+        room = qr.single_frame_bytes(qr.DEFAULT_EC, meta["codec"])
+        sheets = res.get("sheets") or []
+        note = ""
+        if len(sheets) == 1:
+            note = "，另附总览图 %s" % os.path.basename(sheets[0])
+        elif len(sheets) > 1:
+            note = "，另附 %d 页总览图（%s 起）" % (len(sheets), os.path.basename(sheets[0]))
+        if gif_path:
+            note += "，动图 %s" % os.path.basename(gif_path)
         self.queue.put(("log",
-            "✅ %s  %s → %d 张二维码（%s，纠错 %s）%s\n   → 目录 %s" % (
-                name, _human(meta["size"]), len(frames), meta["codec"],
-                qr.DEFAULT_EC.upper(), note, res["dir"])))
-        if len(frames) > qr.MAX_SHEET_TILES:
+            "✅ %s  %s → 压缩后 %s → %d 张二维码（%s，纠错 %s）%s\n   → 目录 %s" % (
+                name, _human(meta["size"]), _human(len(pack.payload)), len(frames),
+                meta["codec"], qr.DEFAULT_EC.upper(), note, target_dir)))
+        if len(frames) == 1:
             self.queue.put(("log",
-                "   ⚠ 共 %d 帧未生成总览图（过多会降低识别率），请逐张传输" % len(frames)))
+                "   ✔ 一张码搞定（当前组合单张上限约 %s 压缩后数据）" % _human(room)))
+        else:
+            self.queue.put(("log",
+                "   单张上限约 %s，压缩后 %s → 拆成 %d 张；总览图或逐张拖入都能还原，顺序无关"
+                % (_human(room), _human(len(pack.payload)), len(frames))))
+        if gif_path:
+            self.queue.put(("log",
+                "   动图可循环播放，手机对着屏幕录一段或边看边扫就行；"
+                "把 gif 丢进「还原二维码 → 选择图片文件」也能直接读全帧"))
+        if not want_png:
+            self.queue.put(("log", "   （本次只输出动图，未写单帧 PNG）"))
         return res["images"]
 
     def _finish(self, info: dict):
@@ -1103,7 +1250,18 @@ class App:
         self.root.destroy()
 
 
+def _enable_dpi_awareness() -> None:
+    """让进程感知 DPI：不设的话，150% 缩放下框选屏幕的坐标和截图会错位。"""
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:  # 非 Windows / 老系统
+        pass
+
+
 def main() -> int:
+    _enable_dpi_awareness()
     if _HAS_DND:
         try:
             root = TkinterDnD.Tk()

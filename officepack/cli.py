@@ -169,7 +169,7 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
     if codec_name not in qr.ALNUM_CODECS:
         factor = qr.bits_per_char(codec_name) / qr._BITS_ALNUM
         print("· 编码器 %s 不落在二维码的字母数字模式，同样数据要多占约 %.1f 倍空间；"
-              "想少几张码可加 --codec base32" % (codec_name, factor))
+              "想少几张码请加 --preset qr（qr45 + max）" % (codec_name, factor))
 
     failed = 0
     for src in args.files:
@@ -204,25 +204,43 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
         try:
             res = qr.render_images(frames, target_dir, stem, ec=args.qr_ec,
                                    sheet=not args.no_sheet, target_px=args.qr_px)
+            gif_path = None
+            if args.qr_gif and len(frames) > 1:
+                gif_path = os.path.join(target_dir, "%s.qr.gif" % stem)
+                qr.render_gif(frames, gif_path, ec=args.qr_ec,
+                              fps=args.qr_gif, target_px=min(args.qr_px, 720))
         except (qr.QRError, OSError) as exc:
             print("✗ %s：生成二维码失败 %s" % (os.path.basename(src), exc))
             failed += 1
             continue
 
         meta = pack.meta
+        room = qr.single_frame_bytes(args.qr_ec, meta["codec"])
         print("✅ %s" % os.path.basename(src))
-        print("   原始 %s → %d 张二维码（%s，纠错 %s，%d 帧字符）"
-              % (_human(meta["size"]), len(frames), meta["codec"],
-                 args.qr_ec.upper(), meta["text_chars"]))
+        print("   原始 %s → 压缩后 %s → %d 张二维码（%s，纠错 %s，%d 帧字符）"
+              % (_human(meta["size"]), _human(len(pack.payload)), len(frames),
+                 meta["codec"], args.qr_ec.upper(), meta["text_chars"]))
+        if len(frames) == 1:
+            print("   ✔ 一张码搞定（本组合单张上限约 %s 压缩后数据）" % _human(room))
+        else:
+            print("   单张上限约 %s，压缩后 %s，所以分成 %d 张；"
+                  "总览图一张截图能全部带回，顺序无关"
+                  % (_human(room), _human(len(pack.payload)), len(frames)))
         print("   输出目录 %s" % res["dir"])
-        if res["sheet"]:
-            print("   总览图 %s（一张截图即可带回全部帧）" % os.path.basename(res["sheet"]))
+        sheets = res.get("sheets") or []
+        if len(sheets) == 1:
+            print("   总览图 %s（一张截图即可带回全部帧）" % os.path.basename(sheets[0]))
+        elif len(sheets) > 1:
+            print("   总览图 %d 页：%s …（每页截一张图，覆盖该页 12 帧）"
+                  % (len(sheets), os.path.basename(sheets[0])))
         print("   单帧图 %s … %s" % (os.path.basename(res["images"][0]),
                                     os.path.basename(res["images"][-1])))
         print("   还原：officepack unpack 图片或目录 [-p 口令]")
-        if len(frames) > qr.MAX_SHEET_TILES:
-            print("   ⚠ 共 %d 帧，未生成总览图（过多会降低识别率），请逐张传输"
-                  % len(frames))
+        if len(sheets) > 1:
+            print("   共 %d 帧 / %d 页总览图，截图按页来最省事" % (len(frames), len(sheets)))
+        if gif_path:
+            print("   动图 %s（%.1f 帧/秒，循环播放；也能直接当输入丢给 unpack）"
+                  % (os.path.basename(gif_path), args.qr_gif))
     return 1 if failed else 0
 
 
@@ -424,7 +442,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_pack.add_argument("--qr-px", type=int, default=960, metavar="N",
                         help="每张二维码的目标像素宽（默认 960）")
     p_pack.add_argument("--no-sheet", action="store_true",
-                        help="不生成总览图（默认帧数 ≤ %d 时会拼一张）" % qr.MAX_SHEET_TILES)
+                        help="不生成总览图（默认每 %d 帧拼一页，多页自动续）" % qr.MAX_SHEET_TILES)
+    p_pack.add_argument("--qr-gif", type=float, nargs="?", const=3.0, default=0.0,
+                        metavar="FPS",
+                        help="额外输出循环播放的 GIF 动图（默认 3 帧/秒），适合手机对着屏幕扫")
     add_pack_opts(p_pack)
     p_pack.set_defaults(func=cmd_pack)
 

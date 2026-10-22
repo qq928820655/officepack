@@ -646,10 +646,21 @@ def unpack_texts(
     for doc_id in sorted(groups):
         result = unpack_text(join_segments(groups[doc_id]), password)
         results.append((_write_result(result, target_dir, out_name), result.meta))
+    # 独立的整容器（不是分片）。这里要**宽容**一点：扫码时 zxing 偶尔会从噪点里
+    # 「读出」三五个字符（实测 129 帧的动图混进过一个 `B40B`），如果它作为一块
+    # 独立文本去解析就会抛「缺少起始标记」，把整批还原全带崩。已经收到正常分片时
+    # 直接忽略解不动的块；只有**全都**解不动才把原始报错抛出去。
+    failed: Exception | None = None
     for text in standalone:
-        result = unpack_text(text, password)
+        try:
+            result = unpack_text(text, password)
+        except ContainerError as exc:
+            failed = failed or exc
+            continue
         results.append((_write_result(result, target_dir, out_name), result.meta))
     if not results:
+        if failed is not None:
+            raise failed
         raise ContainerError("没有可还原的内容")
     return results
 

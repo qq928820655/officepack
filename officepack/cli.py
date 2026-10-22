@@ -14,6 +14,7 @@ import argparse
 import getpass
 import os
 import sys
+import time
 
 from . import container as ct
 from . import codecs as codec_mod
@@ -35,6 +36,34 @@ def _human(n: float) -> str:
             return ("%.0f %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
         n /= 1024
     return "%.1f GiB" % n
+
+
+def _progress():
+    """命令行进度条：同一行原地覆写。
+
+    大文件出码动辄几百帧，几秒钟一个字都不打，用的人会以为命令挂住了。
+    这里每 0.2 秒刷一次，跑完自动换行，保证后面的正式输出不会接在进度条后面。
+    """
+    state = {"t": 0.0, "last": ""}
+
+    def report(done: int, total: int, phase: str = ""):
+        total = max(1, int(total))
+        done = max(0, min(int(done), total))
+        now = time.monotonic()
+        if done < total and now - state["t"] < 0.2:
+            return
+        state["t"] = now
+        width = 22
+        filled = int(done * width / total)
+        line = "   %-10s |%s%s| %3d%% (%d/%d)" % (
+            (phase or "处理")[:10], "█" * filled, "·" * (width - filled),
+            int(done * 100 / total), done, total)
+        pad = max(0, len(state["last"]) - len(line))
+        sys.stdout.write("\r" + line + " " * pad + ("\n" if done >= total else ""))
+        sys.stdout.flush()
+        state["last"] = line if done < total else ""
+
+    return report
 
 
 def _password(args, confirm: bool = False, need: bool = False) -> str | None:
@@ -201,15 +230,17 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
 
         target_dir = out_dir or os.path.dirname(os.path.abspath(src))
         stem = os.path.basename(src)
+        tick = _progress()
         try:
             res = qr.render_images(frames, target_dir, stem, ec=args.qr_ec,
                                    sheet=not args.no_sheet, target_px=args.qr_px,
-                                   single=not args.no_single)
+                                   single=not args.no_single, progress=tick)
             gif_path = None
             if args.qr_gif and len(frames) > 1:
                 gif_path = os.path.join(target_dir, "%s.qr.gif" % stem)
                 qr.render_gif(frames, gif_path, ec=args.qr_ec,
-                              fps=args.qr_gif, target_px=min(args.qr_px, 720))
+                              fps=args.qr_gif, target_px=min(args.qr_px, 720),
+                              progress=tick)
         except (qr.QRError, OSError) as exc:
             print("✗ %s：生成二维码失败 %s" % (os.path.basename(src), exc))
             failed += 1
@@ -273,7 +304,7 @@ def cmd_unpack(args) -> int:
     texts: list[str] = []
     if image_srcs:
         try:
-            shots = qr.decode_images(image_srcs)
+            shots = qr.decode_images(image_srcs, progress=_progress())
         except (qr.QRError, OSError) as exc:
             print("✗ 二维码识别失败：%s" % exc)
             return 1

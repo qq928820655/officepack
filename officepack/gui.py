@@ -168,6 +168,12 @@ class App:
         self._scan_cancelled = False
         self._log_lines = 6                    # 日志框行数，屏幕不够时会被自动压缩
         self._poll_id: str | None = None       # 队列轮询的 after id
+        # 当前文件内部的进度（第几张码 / 第几张图）。大文件出码是几百帧的活，
+        # 只看文件级进度条会以为程序卡死了，所以另开一条细分进度 + 文字。
+        self._bar_t0 = 0.0
+        self._bar_tick = 0.0
+        self._bar_logged = -1                  # 已经打过的百分比刻度（每 10% 一行）
+        self._bar_last = (0, 1, "")
 
         root.title(APP_TITLE)
 
@@ -362,7 +368,15 @@ class App:
         bottom = ttk.LabelFrame(self.root, text="日志")
         bottom.pack(fill="both", padx=10, pady=(4, 10))
         self.progress = ttk.Progressbar(bottom, mode="determinate")
-        self.progress.pack(fill="x", padx=8, pady=(6, 4))
+        self.progress.pack(fill="x", padx=8, pady=(6, 2))
+        # 二级进度：**当前文件内部**走到哪了（渲染第几张码 / 识别第几张图）。
+        # 一条码要出几百张时，文件级进度一动不动 —— 有了这条才看得出还在干活。
+        sub = ttk.Frame(bottom)
+        sub.pack(fill="x", padx=8, pady=(0, 4))
+        self.sub_progress = ttk.Progressbar(sub, mode="determinate")
+        self.sub_progress.pack(side="left", fill="x", expand=True)
+        self.prog_text = ttk.Label(sub, text="", foreground="#0a58ca", width=34, anchor="e")
+        self.prog_text.pack(side="left", padx=(8, 0))
         self.log = tk.Text(bottom, height=self._log_lines, wrap="none", font=("Consolas", 9),
                            bg="#fbfbfb", relief="flat", state="disabled")
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1413,6 +1427,56 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _start_bar(self):
+        """换一个文件/换一个阶段：细分进度条归零，重新开始计时。"""
+        self._bar_t0 = time.monotonic()
+        self._bar_tick = self._bar_t0
+        self._bar_logged = -1
+        self._bar_last = (0, 1, "")
+        try:
+            self.sub_progress.configure(maximum=1, value=0)
+            self.prog_text.configure(text="")
+        except tk.TclError:
+            pass
+
+    def _set_bar(self, done, total, phase=""):
+        """刷新当前文件的帧级进度（工作线程经队列派过来，只在主线程执行）。"""
+        total = max(1, int(total))
+        done = max(0, min(int(done), total))
+        self._bar_last = (done, total, phase)
+        self._bar_tick = time.monotonic()
+        try:
+            self.sub_progress.configure(maximum=total, value=done)
+        except tk.TclError:
+            return
+        pct = int(done * 100 / total)
+        text = "%s %d%% (%d/%d)" % (phase or "处理", pct, done, total)
+        elapsed = self._bar_tick - self._bar_t0 if self._bar_t0 else 0.0
+        if elapsed >= 1.0:          # 刚起步那一瞬间显示「· 0.0s」没有意义
+            text += " · %.1fs" % elapsed
+        self.prog_text.configure(text=text)
+        # 日志每 10% 留一行：事后翻日志能看出「哪一步花了多久」，也能确认没卡死
+        if pct // 10 > self._bar_logged:
+            self._bar_logged = pct // 10
+            self._log("   %s %d%%（%d/%d）" % (phase or "处理", pct, done, total))
+
+    def _bar_heartbeat(self):
+        """一秒一跳的心跳：长任务里进度不动时，至少让人看出还在跑。"""
+        if not self._bar_t0 or not (self.worker and self.worker.is_alive()):
+            return
+        now = time.monotonic()
+        if now - self._bar_tick < 1.0:
+            return
+        self._bar_tick = now
+        done, total, phase = self._bar_last
+        pct = int(done * 100 / max(1, total))
+        try:
+            self.prog_text.configure(
+                text="%s %d%% (%d/%d) · %.0fs"
+                % (phase or "处理中", pct, done, total, now - self._bar_t0))
+        except tk.TclError:
+            pass
+
     def start(self):
         if self.worker and self.worker.is_alive():
             return
@@ -1436,6 +1500,7 @@ class App:
 
         self.go.configure(state="disabled", text="处理中…")
         self.progress.configure(maximum=len(self.files), value=0)
+        self._start_bar()
         self._log("── 开始%s，共 %d 个文件 ──" % ("打包" if mode == "pack" else "还原", len(self.files)))
         files = list(self.files)
         self.worker = threading.Thread(
@@ -1457,7 +1522,9 @@ class App:
         if mode == "unpack":
             # 分段必须整体合并还原，不能逐个文件处理；图片和文本混着给也能一起还原
             try:
-                results, stats = qr.unpack_any(files, out_dir, password)
+                results, stats = qr.unpack_any(files, out_dir, password,
+                                               progress=self._qr_progress())
+                self.queue.put(("bar", (1, 1, "识别完成")))
                 if stats["images"]:
                     self.queue.put(("log",
                         "· %d 张图片扫回 %d 段 + %d 个文本容器 → 合并还原"
@@ -1479,6 +1546,7 @@ class App:
 
         for src in files:
             name = os.path.basename(src)
+            self._start_bar()
             try:
                 if as_qr:
                     paths = self._pack_one_qr(src, name, out_dir, password, cipher,
@@ -1488,6 +1556,7 @@ class App:
                     continue
 
                 out_path = None
+                self.queue.put(("bar", (0, 1, "压缩加密")))
                 if out_dir:
                     out_path = os.path.join(
                         out_dir, os.path.basename(ct.default_out_path(src, codec_name))
@@ -1516,11 +1585,22 @@ class App:
         self.queue.put(("done", {"ok": ok, "fail": len(files) - ok,
                                  "outputs": outputs, "errors": errors}))
 
+    def _qr_progress(self, phase: str | None = None):
+        """给 qr 模块用的进度回调：工作线程 → 队列 → 主线程刷进度条。
+
+        ``phase`` 给了就锁死阶段名（比如「合成动图」），没给就用 qr 自己报的。
+        """
+        def report(done, total, step=""):
+            self.queue.put(("bar", (done, total, phase or step or "处理")))
+        return report
+
     def _pack_one_qr(self, src, name, out_dir, password, cipher, compress_mode,
                      codec_name, outputs, qr_format="PNG（单帧 + 总览）", qr_fps="3"):
         """单个文件走二维码通道；返回写出的图片路径。编码器沿用界面选择。"""
         with open(src, "rb") as fh:
             raw = fh.read()
+        self.queue.put(("bar", (0, 1, "压缩加密")))
+        self.queue.put(("log", "· %s 正在压缩/加密 %s…" % (name, _human(len(raw)))))
         pack = ct.pack_bytes(
             raw, name, codec_name=codec_name,
             cipher_name=cipher, password=password,
@@ -1531,11 +1611,14 @@ class App:
         want_png = qr_format.startswith("PNG") or "+" in qr_format
         want_single = "仅总览" not in qr_format
         want_gif = "GIF" in qr_format and len(frames) > 1
+        self.queue.put(("log", "   拆成 %d 张码，开始出图（%s）…"
+                        % (len(frames), "渲染 PNG" if want_png else "合成动图")))
 
         res = {"images": [], "sheet": None, "sheets": [], "dir": target_dir}
         if want_png:
             res = qr.render_images(frames, target_dir, name, ec=qr.DEFAULT_EC,
-                                   sheet=True, single=want_single)
+                                   sheet=True, single=want_single,
+                                   progress=self._qr_progress("渲染 PNG"))
             outputs.extend(res["images"])
             outputs.extend(res.get("sheets") or [])
 
@@ -1546,7 +1629,8 @@ class App:
             except (TypeError, ValueError):
                 fps = 3.0
             gif_path = os.path.join(target_dir, "%s.qr.gif" % name)
-            qr.render_gif(frames, gif_path, ec=qr.DEFAULT_EC, fps=fps)
+            qr.render_gif(frames, gif_path, ec=qr.DEFAULT_EC, fps=fps,
+                          progress=self._qr_progress("合成动图"))
             outputs.append(gif_path)
 
         meta = pack.meta
@@ -1585,6 +1669,12 @@ class App:
 
         self.go.configure(state="normal", text="开始处理")
         self.progress.configure(value=0)
+        self._bar_t0 = 0.0
+        try:
+            self.sub_progress.configure(value=0)
+            self.prog_text.configure(text="")
+        except tk.TclError:
+            pass
         self._log("── 完成：成功 %d / 失败 %d ──" % (ok, fail))
 
         if outputs:
@@ -1621,6 +1711,7 @@ class App:
             self.open_out_dir()
 
     def _poll_queue(self):
+        bars = None
         try:
             while True:
                 kind, payload = self.queue.get_nowait()
@@ -1628,12 +1719,17 @@ class App:
                     self._log(payload)
                 elif kind == "tick":
                     self.progress.step(payload)
+                elif kind == "bar":
+                    bars = payload      # 积压时只认最后一条，免得主线程被刷爆
                 elif kind == "done":
                     self._finish(payload)
                 elif kind == "call":
                     payload()          # 工作线程派回主线程的回调（弹窗必须在主线程）
         except queue.Empty:
             pass
+        if bars is not None:
+            self._set_bar(*bars)
+        self._bar_heartbeat()
         self._poll_id = self.root.after(120, self._poll_queue)
 
     def _on_close(self):

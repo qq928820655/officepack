@@ -179,6 +179,62 @@ def build_frames(
 # --------------------------------------------------------------------------
 # 生成图片
 # --------------------------------------------------------------------------
+#: 写盘 / 读图用几条线程。zxing-cpp 的**编码器**全程持 GIL，实测 1/2/4/8 线程
+#: 都是 ~14ms/帧，多线程对它没有收益，所以渲染老老实实串行；能并行的只有
+#: 「PNG 编码」和「zxing 解码」—— 这两处 PIL 和 zxing 都会放 GIL，
+#: 4 线程实测分别快 3.7 倍和 2.4 倍，白捡的。
+RENDER_THREADS = 4
+DECODE_THREADS = 4
+
+#: 动图逐帧识别时，并行批次大小与「回头深挖」的帧数上限。
+#: 上千帧的 GIF 不能一次性把几百兆像素全拽进内存，分批走。
+DECODE_BATCH = 48
+DECODE_RETRY = 8
+
+_UNSET = object()
+_ZX_WRITER = _UNSET
+
+
+class _BackendMissing(Exception):
+    """zxing-cpp 不具备写码能力 —— 只有这时才退回 qrcode。"""
+
+
+def _zx_writer():
+    """zxing-cpp 的写码后端；没装 / 版本太老就返回 None。
+
+    为什么换：``qrcode`` 是纯 Python，生成一张 QR 40 版矩阵要 275~350ms，
+    再放大成图，单帧 720ms —— 1MB 文件 451 帧要 **5 分钟**。zxing-cpp 是 C++，
+    同一帧 15ms（含转成 PIL 图），快 40 倍；而且它本来就是识别端的依赖，
+    打包里已经有了，不新增任何东西。
+    """
+    global _ZX_WRITER
+    if _ZX_WRITER is _UNSET:
+        try:
+            import zxingcpp
+
+            _ZX_WRITER = zxingcpp if hasattr(zxingcpp, "create_barcode") else None
+        except Exception:  # noqa: BLE001  没装 zxing / 导入失败
+            _ZX_WRITER = None
+    return _ZX_WRITER
+
+
+def _tick(progress, done: int, total: int, phase: str = "") -> None:
+    """进度回调统一入口 —— 回调自己出错绝不能把出码/识别搞崩。"""
+    if progress is None:
+        return
+    try:
+        progress(int(done), int(total), phase)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ec_level(ec: str) -> str:
+    key = (ec or DEFAULT_EC).upper()
+    if key not in QR_ALNUM_CAPACITY:
+        raise QRError("未知纠错级别 %r，可用：L / M / Q / H" % ec)
+    return key
+
+
 def _ec_const(ec: str):
     import qrcode.constants as C
 
@@ -188,30 +244,17 @@ def _ec_const(ec: str):
         "Q": C.ERROR_CORRECT_Q,
         "H": C.ERROR_CORRECT_H,
     }
-    key = (ec or DEFAULT_EC).upper()
-    if key not in table:
-        raise QRError("未知纠错级别 %r，可用：L / M / Q / H" % ec)
-    return table[key]
+    return table[_ec_level(ec)]
 
 
 def _make_qr_image(text: str, ec: str, target_px: int = 960):
     """生成一张二维码 PIL 图；模块大小按目标像素反推，保证每帧清晰度一致。"""
-    import qrcode
-
-    proto = qrcode.QRCode(error_correction=_ec_const(ec), border=4, box_size=1)
-    proto.add_data(text, optimize=20)
-    proto.make(fit=True)
-    modules = proto.modules_count + 8          # + 两侧各 4 模块静区
-    box = max(3, int(round(target_px / modules)))
-
-    qr = qrcode.QRCode(error_correction=_ec_const(ec), border=4, box_size=box)
-    qr.add_data(text, optimize=20)
-    qr.make(fit=True)
-    return qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    return list(_iter_uniform([text], ec, target_px))[0]
 
 
-def _render_uniform(texts: Sequence[str], ec: str, target_px: int):
-    """把一批文本渲染成**同一像素尺寸**的二维码图。
+def _iter_uniform(texts: Sequence[str], ec: str, target_px: int, progress=None,
+                  base: int = 0, grand_total: int | None = None):
+    """把一批文本渲染成**同一像素尺寸**的二维码图（生成器，出一张丢一张）。
 
     为什么必须统一：每帧的数据量不同，QR 版本（模块数）就不同，按
     ``target_px / 模块数`` 反推的模块大小一取整，产出的图片尺寸就参差不齐
@@ -219,13 +262,78 @@ def _render_uniform(texts: Sequence[str], ec: str, target_px: int):
     会被**裁掉右/下边**，播放器里显示的就是个残缺码，怎么扫都扫不出来 ——
     「框选认不出动图」的根因就在这里。这里统一按最大那帧算模块大小，再把每张
     居中补白到同一画布，静区照样是白的，不影响识别。
+
+    返回的图是 **L 模式**（1 字节/像素）：二维码只有黑白两色，用 RGB 存盘
+    既慢又大三倍，没必要。
+
+    ``base`` / ``grand_total`` 给分批调用用：一次只渲染一页时，进度条要按
+    「整份文件第几张」报，而不是「本页第几张」。
     """
+    texts = list(texts)
+    total = grand_total or len(texts)
+    if not texts:
+        return
+    level = _ec_level(ec)
+    writer = _zx_writer()
+    plan = None
+    if writer is not None:
+        try:
+            plan = _plan_zx(writer, texts, level, target_px)
+        except _BackendMissing:
+            plan = None
+    source = _emit_zx(plan) if plan else _iter_uniform_py(texts, level, target_px)
+    for idx, im in enumerate(source, 1):
+        yield im
+        _tick(progress, base + idx, total, "渲染")
+
+
+def _plan_zx(zx, texts: list[str], level: str, target_px: int):
+    """zxing-cpp 预排：把每帧先编码成矩阵，量出统一倍率，返回 ``(bars, box, side)``。
+
+    这一步是**立即执行**的（不是生成器），所以「zxing 没有写码能力」和
+    「这一帧太大装不下」这两种错误都能在出第一张图之前就报出来。
+    """
+    fmt = getattr(zx.BarcodeFormat, "QRCode")
+    bars, counts = [], []
+    for text in texts:
+        try:
+            bar = zx.create_barcode(text, fmt, ec_level=level)
+            # scale=1 → 每模块 1 像素，只用来量「含静区一共多少个模块」
+            counts.append(int(bar.to_image(scale=1, add_quiet_zones=True).shape[0]))
+        except (ImportError, AttributeError) as exc:  # 绑定缺能力，退回 qrcode
+            raise _BackendMissing(str(exc)) from None
+        except Exception as exc:  # noqa: BLE001  段比这个纠错级别装得下的还大
+            raise QRError("二维码内容超出容量（%s）：请降低纠错级别，"
+                          "或调小每帧字符数/改用 qr45 编码" % exc) from None
+        bars.append(bar)
+    box = max(3, int(round(float(target_px) / max(counts))))
+    return bars, box, max(counts) * box
+
+
+def _emit_zx(plan):
+    """按预排好的统一倍率逐帧出图（L 模式）。"""
+    from PIL import Image
+
+    bars, box, side = plan
+    for bar in bars:
+        view = memoryview(bar.to_image(scale=box, add_quiet_zones=True))
+        height, width = view.shape[0], view.shape[1]
+        im = Image.frombytes("L", (width, height), view.tobytes())
+        if (width, height) != (side, side):
+            canvas = Image.new("L", (side, side), 255)
+            canvas.paste(im, ((side - width) // 2, (side - height) // 2))
+            im = canvas
+        yield im
+
+
+def _iter_uniform_py(texts: list[str], level: str, target_px: int):
+    """退路：纯 Python 的 qrcode。慢 40 倍，只在 zxing 不可写码时用。"""
     import qrcode
     from PIL import Image
 
     counts = []
     for text in texts:
-        proto = qrcode.QRCode(error_correction=_ec_const(ec), border=4, box_size=1)
+        proto = qrcode.QRCode(error_correction=_ec_const(level), border=4, box_size=1)
         proto.add_data(text, optimize=20)
         try:
             proto.make(fit=True)
@@ -233,24 +341,45 @@ def _render_uniform(texts: Sequence[str], ec: str, target_px: int):
             raise QRError("二维码内容超出容量（%s）：请降低纠错级别，"
                           "或调小每帧字符数/改用 qr45 编码" % exc) from None
         counts.append(proto.modules_count + 8)      # + 两侧各 4 模块静区
-    box = max(3, int(round(target_px / max(counts))))
+    box = max(3, int(round(float(target_px) / max(counts))))
+    side = max(counts) * box
 
-    images = []
     for text in texts:
-        qr = qrcode.QRCode(error_correction=_ec_const(ec), border=4, box_size=box)
+        qr = qrcode.QRCode(error_correction=_ec_const(level), border=4, box_size=box)
         qr.add_data(text, optimize=20)
         qr.make(fit=True)
-        images.append(qr.make_image(fill_color="black", back_color="white").convert("RGB"))
-
-    side = max(im.width for im in images)
-    side = max([side] + [im.height for im in images])
-    out = []
-    for im in images:
+        im = qr.make_image(fill_color="black",
+                           back_color="white").convert("L")
         if im.size != (side, side):
-            canvas = Image.new("RGB", (side, side), "white")
+            canvas = Image.new("L", (side, side), 255)
             canvas.paste(im, ((side - im.width) // 2, (side - im.height) // 2))
             im = canvas
-        out.append(im)
+        yield im
+
+
+def _render_uniform(texts: Sequence[str], ec: str, target_px: int) -> list:
+    """``_iter_uniform`` 的列表版（拼总览 / 测试用）。"""
+    return list(_iter_uniform(texts, ec, target_px))
+
+
+#: L → 双色 P 的查找表：0~127（暗）→ 索引 1（黑），128~255（亮）→ 索引 0（白）。
+#: 索引 0 **必须是白**：GIF 的逻辑背景色取调色板 0 号，而我们用
+#: ``disposal=2``（每帧先清成背景色再画差异区域）—— 0 号是黑的话，
+#: 有些播放器会把整屏刷黑再叠差异，画面就成了满屏噪点，怎么都扫不出。
+_BIT_LUT = [1] * 128 + [0] * 128
+
+
+def _bilevel(im):
+    """黑白图转 2 色调色板（GIF 帧）。
+
+    用固定调色板而不是 ``convert("P", palette=ADAPTIVE)``：自适应要先建直方图
+    再量化，实测 27.9ms/帧；固定 LUT 只要 1.1ms，而黑白图两者**逐像素一致**。
+    """
+    from PIL import Image
+
+    out = Image.new("P", im.size)
+    out.putpalette([255, 255, 255, 0, 0, 0])      # 0 = 白（背景），1 = 黑
+    out.paste(im.point(_BIT_LUT))
     return out
 
 
@@ -307,6 +436,7 @@ def render_gif(
     fps: float = 3.0,
     target_px: int = 720,
     markers: bool = True,
+    progress=None,
 ) -> str:
     """把多帧合成一张**循环播放的 GIF**：手机对着屏幕录像/扫码就能一次收全。
 
@@ -319,9 +449,9 @@ def render_gif(
     ``markers=True`` 会在首尾各插一张**标识帧**（``#OPKmark|S`` / ``|E``）：
     屏幕框选时画面是动的，识别端不可能知道一轮从哪开始、到哪结束 —— 有了标识帧，
     它就是「见首帧清零、逐帧收、见尾帧收工」，漏帧还能靠下一轮补齐。
-    """
-    from PIL import Image
 
+    ``progress(done, total, phase)`` 每出一帧回调一次，用来刷进度条。
+    """
     if not frames:
         raise QRError("没有可渲染的帧")
     if len(frames) == 1:
@@ -335,15 +465,26 @@ def render_gif(
         # 首帧 S 在前、尾帧 E 在后：识别端见 S 开始收，见 E 收工
         texts = [marks[0]] + texts + [marks[1]]
 
-    from PIL import Image
-
-    images = [im.convert("P", palette=Image.ADAPTIVE, colors=2)
-              for im in _render_uniform(texts, ec, target_px)]
+    # 边出图边转调色板：GIF 必须一次性拿到所有帧（PIL 的 save_all 要完整列表），
+    # 但 L 模式的中间图可以用完就丢，峰值内存只多一份 P 图。
+    images = [_bilevel(im) for im in
+              _iter_uniform(texts, ec, target_px, progress=progress)]
     images[0].save(
         out_path, "GIF", save_all=True, append_images=images[1:],
         duration=duration, loop=0, optimize=True, disposal=2,
     )
     return out_path
+
+
+def _save_png(job) -> str:
+    """线程池任务：把一张图写成 PNG。
+
+    ``compress_level=6`` 是实测拐点：L 模式 7.6ms/帧、13KB；调成 1 反而
+    18.5ms / 40KB（PNG 的 filter 选路在小图上更费）。多线程再做一次叠加。
+    """
+    im, path = job
+    im.save(path, "PNG", compress_level=6)
+    return path
 
 
 def render_images(
@@ -354,6 +495,7 @@ def render_images(
     sheet: bool = True,
     target_px: int = 960,
     single: bool = True,
+    progress=None,
 ) -> dict:
     """把每帧写成一张 PNG，可选再拼总览图（多帧自动分页，每页 12 张）。
 
@@ -364,8 +506,13 @@ def render_images(
     位图（原尺寸拼贴，没有缩放），识别总览就等于识别全部单帧，少写 N 个文件。
     只有 1 帧时没有总览可拼，会强制回退成单帧输出。
 
+    按页「渲染一页 → 并行写盘 → 拼总览 → 丢掉」流水走，450 帧也不会把
+    几百兆像素全堆在内存里；写盘交给线程池（PIL 的 PNG 编码器放 GIL）。
+
     返回 ``{"images": [...], "sheet": 首页或 None, "sheets": [...], "dir": 目录}``。
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     if not frames:
         raise QRError("没有可渲染的帧")
     os.makedirs(out_dir, exist_ok=True)
@@ -374,28 +521,28 @@ def render_images(
     # 只有一帧时没有总览可言，single=False 也必须老老实实落一张单帧图
     if not sheet or total == 1:
         single = True
+    pages = int(math.ceil(total / float(MAX_SHEET_TILES)))
     images: list[str] = []
-    tiles = []
-    for idx, frame in enumerate(frames, 1):
-        img = _make_qr_image(frame, ec, target_px)
-        if single:
-            path = os.path.join(out_dir, "%s.qr%03d.png" % (stem, idx))
-            img.save(path, "PNG")
-            images.append(path)
-        tiles.append((idx, img))
-
     sheets: list[str] = []
-    if sheet and total > 1:
-        # 分页拼图：一页 12 张。19 帧 → 2 页总览，截两次图就够，
-        # 比逐张传 19 次好太多；单页再大就会到上万像素，识别率反而掉。
-        pages = [tiles[i:i + MAX_SHEET_TILES]
-                 for i in range(0, total, MAX_SHEET_TILES)]
-        for pi, page in enumerate(pages, 1):
-            name = ("%s.qr-all.png" % stem if len(pages) == 1
-                    else "%s.qr-all%d.png" % (stem, pi))
-            path = os.path.join(out_dir, name)
-            _make_sheet(page, total, path, ec)
-            sheets.append(path)
+
+    with ThreadPoolExecutor(max_workers=RENDER_THREADS) as pool:
+        for start in range(0, total, MAX_SHEET_TILES):
+            page = list(frames[start:start + MAX_SHEET_TILES])
+            tiles = [(start + i + 1, im) for i, im in
+                     enumerate(_iter_uniform(page, ec, target_px,
+                                             progress=progress, base=start,
+                                             grand_total=total))]
+            if single:
+                jobs = [(im, os.path.join(out_dir, "%s.qr%03d.png" % (stem, idx)))
+                        for idx, im in tiles]
+                images.extend(pool.map(_save_png, jobs))
+            if sheet and total > 1:
+                name = ("%s.qr-all.png" % stem if pages == 1
+                        else "%s.qr-all%d.png" % (stem, len(sheets) + 1))
+                path = os.path.join(out_dir, name)
+                _make_sheet(tiles, total, path, ec)
+                sheets.append(path)
+            del tiles
     return {"images": images, "sheet": sheets[0] if sheets else None,
             "sheets": sheets, "dir": out_dir}
 
@@ -477,12 +624,13 @@ def unpack_any(
     out_dir: str | None = None,
     password: str | None = None,
     out_name: str | None = None,
+    progress=None,
 ):
     """文本容器与二维码图片混在一起也能还原；返回 (结果列表, 统计)。"""
     images, texts = partition_sources(sources)
     blocks: list[str] = []
     if images:
-        blocks.extend(decode_images(images))
+        blocks.extend(decode_images(images, progress=progress))
     for path in texts:
         with open(path, "r", encoding="utf-8-sig") as fh:
             blocks.append(fh.read())
@@ -493,7 +641,7 @@ def unpack_any(
 
 
 def decode_image(image, deep: bool = True, fast: bool = False,
-                 keep_markers: bool = False) -> list[str]:
+                 keep_markers: bool = False, progress=None) -> list[str]:
     """识别单张图里的所有二维码；可传路径、PIL 图或 numpy 数组。
 
     多帧图（GIF / 动图 PNG / TIFF）会**逐帧**识别 —— 所以一段动态二维码
@@ -508,33 +656,101 @@ def decode_image(image, deep: bool = True, fast: bool = False,
     ``keep_markers`` 只在现场连拍时用：需要拿到 ``#OPKmark`` 首尾标识帧判断
     一轮动图从哪开始、到哪结束；还原时必须丢掉它们，那是控制信号不是数据。
     """
-    import zxingcpp
-    from PIL import Image, ImageSequence
+    from PIL import Image
 
     if isinstance(image, str):
         with Image.open(image) as img:      # 一定要 close：动图会占着文件句柄
-            return _decode_frames(img, deep, fast, keep_markers)
+            return _decode_frames(img, deep, fast, keep_markers, progress)
     if not hasattr(image, "mode"):        # numpy 数组之类，交给 zxing 自己处理
+        import zxingcpp
+
         results = zxingcpp.read_barcodes(image)
         return [r.text for r in results if r.text]
-    return _decode_frames(image, deep, fast, keep_markers)
+    return _decode_frames(image, deep, fast, keep_markers, progress)
+
+
+def _probe_frame(item):
+    """只跑一遍原图识别，不做任何像素变换 —— 一帧几十毫秒。"""
+    _idx, frame = item
+    try:
+        return _read_one(frame, deep=False, fast=True)
+    except Exception:  # noqa: BLE001  单帧读不出来不该拖垮整张动图
+        return []
 
 
 def _decode_frames(img, deep: bool = True, fast: bool = False,
-                   keep_markers: bool = False) -> list[str]:
-    """逐帧识别一张图（静态图就是走一帧）。"""
-    from PIL import ImageSequence
+                   keep_markers: bool = False, progress=None) -> list[str]:
+    """逐帧识别一张图（静态图就是走一帧）。
+
+    动图走两轮：先**并行快扫**每一帧的原图（一次像素变换都不做，几十毫秒
+    一帧），收齐就收工；只有确实一个码都没读到的帧才回头做深度重试。
+
+    老实现是每帧都直接进 6 秒重试预算 —— 129 帧的动图要跑两分半，用户看到
+    的就是「点了之后什么反应都没有」。现在同样的图 2~3 秒。
+    """
+    from concurrent.futures import ThreadPoolExecutor
 
     texts: list[str] = []
     seen: set[str] = set()
-    for frame in ImageSequence.Iterator(img):
-        for text in _read_one(frame, deep, fast):
-            if text in seen:
+
+    def _take(found) -> int:
+        fresh = 0
+        for text in found or ():
+            if not text or text in seen:
                 continue
             if not keep_markers and is_marker(text):
                 continue
             seen.add(text)
             texts.append(text)
+            fresh += 1
+        return fresh
+
+    try:
+        count = int(getattr(img, "n_frames", 1))
+    except Exception:  # noqa: BLE001
+        count = 1
+
+    if count <= 1:
+        _take(_read_one(img, deep=deep, fast=fast))
+        _tick(progress, 1, 1, "识别")
+        return texts
+
+    if fast:                       # 连拍模式：一枪只认原图，别在单帧上纠缠
+        for i in range(count):
+            img.seek(i)
+            _take(_read_one(img, deep=False, fast=True))
+        _tick(progress, count, count, "识别")
+        return texts
+
+    barren: list[int] = []
+    workers = max(1, min(DECODE_THREADS, count))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for start in range(0, count, DECODE_BATCH):
+            stop = min(start + DECODE_BATCH, count)
+            batch = []
+            for i in range(start, stop):
+                img.seek(i)
+                batch.append((i, img.copy()))
+            for (idx, _frame), found in zip(batch, pool.map(_probe_frame, batch)):
+                if not _take(found):
+                    barren.append(idx)
+            del batch
+            _tick(progress, stop, count, "识别")
+            if _looks_complete(texts):
+                return texts
+
+    if not barren or not deep:
+        return texts
+
+    # 还没收齐：只对「一个码都没读到」的帧回头深挖（6 秒预算只在真需要时花）。
+    # 缺的帧常常是被水印糊住 / 被缩放插值毁掉的那几张，值得单独救一次。
+    retry = barren[:DECODE_RETRY]
+    for n, i in enumerate(retry, 1):
+        img.seek(i)
+        _take(_read_one(img.copy(), deep=True))
+        _tick(progress, n, len(retry), "重试缺帧")
+        if _looks_complete(texts):
+            break
     return texts
 
 
@@ -856,14 +1072,29 @@ def _tiles(img, cols: int = 2, overlap: float = 0.12):
 THRESHOLDS = (60, 80, 100, 120)
 
 
+def _padded(img, ratio: float = 0.10):
+    """四周补白：截图/框选把静区切掉了，是最常见的「怎么扫都扫不出」之一。
+
+    二维码规范要求四周留 4 模块静区，少一圈 zxing 就定不到位。裁掉静区的
+    图补白回来往往立刻能读，而且这一步几乎不花钱（一次 paste + 一次解码）。
+    """
+    from PIL import Image
+
+    pad = max(8, int(min(img.width, img.height) * ratio))
+    out = Image.new("L", (img.width + pad * 2, img.height + pad * 2), 255)
+    out.paste(img.convert("L"), (pad, pad))
+    return out
+
+
 def _cheap_variants(img):
-    """便宜的像素变换：固定阈值去屏幕水印 → Otsu → 反色 → 单通道 → 2 倍放大。
+    """便宜的像素变换：补静区 → 固定阈值去屏幕水印 → Otsu → 反色 → 单通道 → 2 倍放大。
 
     屏幕/看图软件叠的水印是半透明浅色，二维码是纯黑；用低阈值把「不够黑」的
     像素全漂白，水印就没了。多档是因为水印深浅、透明度都不可知。
     """
     from PIL import Image
 
+    yield _padded(img)
     gray = img.convert("L")
     for level in THRESHOLDS:
         yield gray.point([0 if v < level else 255 for v in range(256)])
@@ -898,30 +1129,96 @@ def _expensive_variants(img):
         yield _otsu(tile)
 
 
-def decode_images(paths: Iterable[str]) -> list[str]:
+def decode_images(paths: Iterable[str], progress=None) -> list[str]:
     """把若干张图片/目录里的二维码全部扫出来，按出现顺序去重。
 
     同一张总览图里的多帧、多张单帧图混在一起都可以。
+
+    多张图之间**并行**识别：zxing 的 ``read_barcodes`` 会放 GIL，实测 4 张
+    同时读比一张张读快 2.4 倍。``progress`` 按「已读完几张图」回调。
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     files = _iter_images(paths)
     if not files:
         raise QRError("没有找到图片文件（支持 %s）" % "、".join(IMAGE_EXTS))
 
+    total = len(files)
+    # 只有一张图时值得深挖（可能是带水印的总览图）；多张时缺的帧在别的图里
+    deep = total == 1
+
+    def _one(path):
+        try:
+            return decode_image(path, deep=deep), None
+        except Exception as exc:  # noqa: BLE001  坏图不该让整批失败
+            return [], exc
+
     texts: list[str] = []
     seen = set()
-    # 只有一张图时值得深挖（可能是带水印的总览图）；多张时缺的帧在别的图里
-    deep = len(files) == 1
-    for path in files:
-        for text in decode_image(path, deep=deep):
+    first_error = None
+    if total == 1:
+        found, error = _one(files[0])
+        first_error = error
+        for text in found:
             if text not in seen:
                 seen.add(text)
                 texts.append(text)
+        _tick(progress, 1, 1, "识别")
+    else:
+        workers = max(1, min(DECODE_THREADS, total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for done, (found, error) in enumerate(pool.map(_one, files), 1):
+                if error is not None and first_error is None:
+                    first_error = error
+                for text in found:
+                    if text not in seen:
+                        seen.add(text)
+                        texts.append(text)
+                _tick(progress, done, total, "识别图片")
     if not texts:
+        if first_error is not None:
+            raise QRError(str(first_error))
         raise QRError(
-            "这 %d 张图里没有识别到二维码。截图时请让整张码完整入镜、"
-            "不要过度缩放或加滤镜。" % len(files)
+            "这 %d 张图里没有识别到二维码%s。\n"
+            "· 让整张码完整入镜、四周留白边，别把图缩得太小（屏幕上每模块至少 3 像素）\n"
+            "· 如果是 1.4.1 之前生成的动图，请用新版重新生成一次 ——"
+            "旧版每帧尺寸不一，GIF 会把大帧裁掉右/下边，任何扫码器都读不出\n"
+            "· 一次不行别硬扛：「粘贴识别面板」可以一张一张累加，顺序随意"
+            % (total, _animation_hint(files))
         )
-    return texts
+    return _drop_garbage(texts)
+
+
+def _drop_garbage(texts: list[str]) -> list[str]:
+    """扔掉误识别出来的碎片。
+
+    zxing 偶尔会从噪点里「读出」三五个字符（实测 129 帧的动图混进过一个 ``B40B``）。
+    它本身没害处，但会作为「一个独立容器」进到还原流程里，把整批还原带崩
+    （报「缺少起始标记」，用户看到的就是「明明所有码都扫到了却还原失败」）。
+
+    只在这批结果里**确实有本工具的分段/容器**时才过滤 —— 万一用户拿本工具去读
+    别人的二维码，那就原样返回，不能自作主张删东西。
+    """
+    heads = (ct.SEG_PREFIX, ct.BEGIN)
+    if not any(t.lstrip().startswith(heads) for t in texts):
+        return texts
+    return [t for t in texts
+            if t.lstrip().startswith(heads) or ct.parse_segments(t)]
+
+
+def _animation_hint(files: list[str]) -> str:
+    """失败时补一句「这里有个 N 帧的动图」—— 用户才知道自己给的是动图不是静图。"""
+    try:
+        from PIL import Image
+
+        for path in files[:3]:
+            with Image.open(path) as im:
+                frames = int(getattr(im, "n_frames", 1))
+                if frames > 1:
+                    return "（其中 %s 是 %d 帧的动图）" % (os.path.basename(path), frames)
+    except Exception:  # noqa: BLE001  诊断信息拿不到就不给，不能盖住真正的错误
+        pass
+    return ""
 
 
 def unpack_images(
@@ -929,9 +1226,10 @@ def unpack_images(
     out_dir: str | None = None,
     password: str | None = None,
     out_name: str | None = None,
+    progress=None,
 ):
     """识别图片里的二维码 → 合并分帧 → 还原文件。"""
-    texts = decode_images(paths)
+    texts = decode_images(paths, progress=progress)
     return ct.unpack_texts(texts, out_dir=out_dir, password=password, out_name=out_name)
 
 

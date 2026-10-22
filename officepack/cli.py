@@ -203,7 +203,8 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
         stem = os.path.basename(src)
         try:
             res = qr.render_images(frames, target_dir, stem, ec=args.qr_ec,
-                                   sheet=not args.no_sheet, target_px=args.qr_px)
+                                   sheet=not args.no_sheet, target_px=args.qr_px,
+                                   single=not args.no_single)
             gif_path = None
             if args.qr_gif and len(frames) > 1:
                 gif_path = os.path.join(target_dir, "%s.qr.gif" % stem)
@@ -233,8 +234,12 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
         elif len(sheets) > 1:
             print("   总览图 %d 页：%s …（每页截一张图，覆盖该页 12 帧）"
                   % (len(sheets), os.path.basename(sheets[0])))
-        print("   单帧图 %s … %s" % (os.path.basename(res["images"][0]),
-                                    os.path.basename(res["images"][-1])))
+        if res["images"]:
+            print("   单帧图 %s … %s" % (os.path.basename(res["images"][0]),
+                                        os.path.basename(res["images"][-1])))
+        elif sheets:
+            print("   本次只写了总览图（--no-single）：总览里每张码和单帧同尺寸，"
+                  "识别总览就等于识别单帧")
         print("   还原：officepack unpack 图片或目录 [-p 口令]")
         if len(sheets) > 1:
             print("   共 %d 帧 / %d 页总览图，截图按页来最省事" % (len(frames), len(sheets)))
@@ -443,6 +448,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="每张二维码的目标像素宽（默认 960）")
     p_pack.add_argument("--no-sheet", action="store_true",
                         help="不生成总览图（默认每 %d 帧拼一页，多页自动续）" % qr.MAX_SHEET_TILES)
+    p_pack.add_argument("--no-single", action="store_true",
+                        help="只输出总览图，不写单帧 PNG（总览里每张码和单帧尺寸相同，"
+                             "识别总览即可；只有 1 帧时仍写单帧）")
     p_pack.add_argument("--qr-gif", type=float, nargs="?", const=3.0, default=0.0,
                         metavar="FPS",
                         help="额外输出循环播放的 GIF 动图（默认 3 帧/秒），适合手机对着屏幕扫")

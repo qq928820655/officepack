@@ -134,6 +134,47 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(gui_mod.preview_mod.kind_of(".pdf"), "PDF 文档")
         self.assertEqual(gui_mod.preview_mod.kind_of(".exe"), "可执行/库")
 
+    def test_cursor_monitor_returns_screen_rect(self):
+        """框选要覆盖鼠标所在那块屏：矩形必须真实可框，不能是 0×0。"""
+        left, top, right, bottom = self.app._cursor_monitor()
+        self.assertGreater(right - left, 100, "屏幕宽度异常：%r" % ((left, top, right, bottom),))
+        self.assertGreater(bottom - top, 100, "屏幕高度异常：%r" % ((left, top, right, bottom),))
+        # 副屏在主屏左边时 left 是负的，这正是「支持多屏」的关键
+        self.assertGreaterEqual(right, 0)
+        self.assertGreaterEqual(bottom, 0)
+
+    def test_qr_format_offers_sheet_only(self):
+        """「只出总览」必须是下拉里的正式选项，不能藏在命令行参数里。"""
+        values = self.app.qr_fmt_box.cget("values")
+        self.assertIn("PNG（仅总览）", values)
+        self.assertIn("PNG（单帧 + 总览）", values)
+
+    def test_paste_panel_opens_and_recovers(self):
+        """粘贴识别面板要能开出来（含 Ditto 按钮），关掉后不留残窗。"""
+        before = set(self.root.winfo_children())
+        self.app.paste_unpack()
+        self.root.update()
+        panels = [w for w in self.root.winfo_children()
+                  if isinstance(w, tk.Toplevel) and w not in before
+                  and "粘贴" in w.title()]
+        self.assertTrue(panels, "粘贴识别面板没有打开")
+        panel = panels[-1]
+        from tkinter import ttk as ttk_mod
+
+        buttons = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, ttk_mod.Button):
+                    buttons.append(child.cget("text"))
+                walk(child)
+
+        walk(panel)
+        for text in ("读剪贴板", "打开 Ditto 剪贴板", "选图片文件…", "还原"):
+            self.assertIn(text, buttons, "面板缺按钮：%s" % text)
+        panel.destroy()
+        self.root.update()
+
 
 if __name__ == "__main__":
     unittest.main()

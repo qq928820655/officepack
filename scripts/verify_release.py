@@ -266,6 +266,62 @@ def test_qr_preset_and_gif(srcdir: str, samples: dict[str, bytes]) -> str:
     return "qr 预设 %d 帧 → GIF 往返一致" % gif_frames
 
 
+def test_qr_multi_images(srcdir: str, samples: dict[str, bytes]) -> str:
+    """多张单帧图**打乱顺序**一次喂回去：必须全部识别后合并，不能只认最后一张。"""
+    outdir = os.path.join(OUT, "qr_multi")
+    _fresh(outdir)
+    rnd = random.Random(20261023)
+    big = os.path.join(srcdir, "multi.blob")
+    with open(big, "wb") as fh:
+        fh.write(bytes(rnd.getrandbits(8) for _ in range(9000)))
+
+    run_cli(["pack", big, "-o", outdir, "--qr", "--preset", "qr", "--no-sheet"])
+    pngs = sorted(os.path.join(outdir, n) for n in os.listdir(outdir)
+                  if n.lower().endswith(".png") and "all" not in n.lower())
+    if len(pngs) < 3:
+        raise RuntimeError("只出了 %d 张图，测不出多图合并" % len(pngs))
+
+    restored = outdir + "_restored"
+    _fresh(restored)
+    run_cli(["unpack"] + list(reversed(pngs)) + ["-o", restored])
+    got = os.listdir(restored)
+    with open(big, "rb") as fh:
+        want = sha(fh.read())
+    if len(got) != 1 or sha_file(os.path.join(restored, got[0])) != want:
+        raise RuntimeError("%d 张图乱序合并后还原不一致（输出 %r）" % (len(pngs), got))
+    return "%d 张单帧图倒序喂入 → 合并一致" % len(pngs)
+
+
+def test_qr_sheet_only(srcdir: str, samples: dict[str, bytes]) -> str:
+    """--no-single：只写总览图，且这张总览图能独立还原出完整文件。"""
+    outdir = os.path.join(OUT, "qr_sheet_only")
+    _fresh(outdir)
+    rnd = random.Random(20261024)
+    big = os.path.join(srcdir, "sheet.blob")
+    with open(big, "wb") as fh:
+        fh.write(bytes(rnd.getrandbits(8) for _ in range(6000)))
+
+    run_cli(["pack", big, "-o", outdir, "--qr", "--preset", "qr", "--no-single"])
+    singles = [n for n in os.listdir(outdir)
+               if n.lower().endswith(".png") and "all" not in n.lower()]
+    sheets = [n for n in os.listdir(outdir)
+              if n.lower().endswith(".png") and "all" in n.lower()]
+    if singles:
+        raise RuntimeError("说了只出总览，却仍写了 %d 张单帧图" % len(singles))
+    if not sheets:
+        raise RuntimeError("没有生成总览图")
+
+    restored = outdir + "_restored"
+    _fresh(restored)
+    run_cli(["unpack", os.path.join(outdir, sheets[0]), "-o", restored])
+    got = os.listdir(restored)
+    with open(big, "rb") as fh:
+        want = sha(fh.read())
+    if len(got) != 1 or sha_file(os.path.join(restored, got[0])) != want:
+        raise RuntimeError("只靠总览图还原失败")
+    return "只写总览图；单张总览还原一致"
+
+
 def test_trimmed_bundle_intact() -> str:
     """瘦身删掉的文件不能是被 import 链依赖的 —— 用真实 exe 反证。"""
     import glob
@@ -400,11 +456,15 @@ def main() -> int:
     print("\n[6] 二维码 qr 预设 + 动图")
     check("qr45 出码 → GIF 逐帧还原", test_qr_preset_and_gif, srcdir, samples)
 
-    print("\n[7] 瘦身完整性")
+    print("\n[7] 二维码 多图 / 仅总览")
+    check("多张单帧图乱序合并还原", test_qr_multi_images, srcdir, samples)
+    check("--no-single 只出总览且能还原", test_qr_sheet_only, srcdir, samples)
+
+    print("\n[8] 瘦身完整性")
     check("精简后功能仍然正常", test_trimmed_bundle_intact)
 
     if "--no-gui" not in sys.argv:
-        print("\n[8] 图形界面")
+        print("\n[9] 图形界面")
         if os.path.isfile(GUI):
             check("GUI 启动 / 窗口完整显示", test_gui)
         else:

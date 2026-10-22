@@ -250,11 +250,16 @@ def render_images(
     ec: str = DEFAULT_EC,
     sheet: bool = True,
     target_px: int = 960,
+    single: bool = True,
 ) -> dict:
     """把每帧写成一张 PNG，可选再拼总览图（多帧自动分页，每页 12 张）。
 
     单页塞太多码会有上万像素，扫起来反而容易漏（实测 125 帧的 11700×11000
     总览图会丢帧），所以按每页 12 张分页 —— 19 帧就是 2 张总览图，截两次图搞定。
+
+    ``single=False`` 只写总览图、不写单帧 PNG：总览里的每张码和单帧是同一份
+    位图（原尺寸拼贴，没有缩放），识别总览就等于识别全部单帧，少写 N 个文件。
+    只有 1 帧时没有总览可拼，会强制回退成单帧输出。
 
     返回 ``{"images": [...], "sheet": 首页或 None, "sheets": [...], "dir": 目录}``。
     """
@@ -263,13 +268,17 @@ def render_images(
     os.makedirs(out_dir, exist_ok=True)
 
     total = len(frames)
+    # 只有一帧时没有总览可言，single=False 也必须老老实实落一张单帧图
+    if not sheet or total == 1:
+        single = True
     images: list[str] = []
     tiles = []
     for idx, frame in enumerate(frames, 1):
         img = _make_qr_image(frame, ec, target_px)
-        path = os.path.join(out_dir, "%s.qr%03d.png" % (stem, idx))
-        img.save(path, "PNG")
-        images.append(path)
+        if single:
+            path = os.path.join(out_dir, "%s.qr%03d.png" % (stem, idx))
+            img.save(path, "PNG")
+            images.append(path)
         tiles.append((idx, img))
 
     sheets: list[str] = []
@@ -380,31 +389,34 @@ def unpack_any(
     return results, {"images": len(images), "texts": len(texts), "blocks": len(blocks)}
 
 
-def decode_image(image) -> list[str]:
+def decode_image(image, deep: bool = True) -> list[str]:
     """识别单张图里的所有二维码；可传路径、PIL 图或 numpy 数组。
 
     多帧图（GIF / 动图 PNG / TIFF）会**逐帧**识别 —— 所以一段动态二维码
     存成 gif 后，直接把它丢进来就能收全所有帧，不用逐帧截图。
+
+    ``deep=False`` 是「一批图里的其中一张」：每张只给 1.5 秒、不做昂贵重试，
+    避免一次多选十几张图等上几分钟。
     """
     import zxingcpp
     from PIL import Image, ImageSequence
 
     if isinstance(image, str):
         with Image.open(image) as img:      # 一定要 close：动图会占着文件句柄
-            return _decode_frames(img)
+            return _decode_frames(img, deep)
     if not hasattr(image, "mode"):        # numpy 数组之类，交给 zxing 自己处理
         results = zxingcpp.read_barcodes(image)
         return [r.text for r in results if r.text]
-    return _decode_frames(image)
+    return _decode_frames(image, deep)
 
 
-def _decode_frames(img) -> list[str]:
+def _decode_frames(img, deep: bool = True) -> list[str]:
     """逐帧识别一张图（静态图就是走一帧）。"""
     from PIL import ImageSequence
 
     texts: list[str] = []
     for frame in ImageSequence.Iterator(img):
-        texts.extend(_read_one(frame))
+        texts.extend(_read_one(frame, deep))
     return _dedup(texts)
 
 
@@ -418,8 +430,31 @@ def _dedup(items: list[str]) -> list[str]:
     return out
 
 
-def _read_one(img) -> list[str]:
-    """识别一张（单帧）图里的所有码。"""
+#: 一次识别的重试预算（秒）。超时就带着已识别到的帧返回 ——
+#: 屏幕上还有水印/缩放问题时，宁可少几帧让人补拍，也不能让界面卡死。
+RETRY_BUDGET = 6.0
+
+#: 一批图里的单张预算。多选 10 张图时按 6 秒/张算就是 1 分钟，用户等不了；
+#: 批次里缺的帧通常就在别的图里（一张图装不下才拆的），深挖这张不划算。
+BATCH_BUDGET = 1.5
+
+#: 超过这个像素数就不再做 2 倍放大：放大后几十兆像素，zxing 要跑几十秒
+UPSCALE_LIMIT = 6_000_000
+
+
+def _read_one(img, deep: bool = True) -> list[str]:
+    """识别一张（单帧）图里的所有码；识别不全就逐级加码重试。
+
+    屏幕截图里常有水印、半透明蒙层、看图软件的缩放插值，一次 zxing 掉帧很正常。
+    这里先按原图识别，只要段头显示「还没收全」就依次试：固定阈值二值化（抹掉
+    半透明水印）、Otsu、反色、单通道、放大（补缩放糊掉的模块）、中值滤波、
+    重叠切块。收全就立刻停，且有总时间预算，不会卡死界面。
+
+    ``deep=False`` 用于「一次给一批图」的场合：预算缩短到 1.5 秒、跳过切块，
+    因为缺的帧多半在别的图里，不该在一张图上耗 6 秒。
+    """
+    import time
+
     import zxingcpp
     from PIL import Image
 
@@ -434,10 +469,175 @@ def _read_one(img) -> list[str]:
                          Image.LANCZOS)
 
     try:
-        results = zxingcpp.read_barcodes(img)
+        texts = [r.text for r in zxingcpp.read_barcodes(img) if r.text]
     except Exception as exc:  # 损坏图片 / 不支持的格式
         raise QRError("二维码识别失败：%s" % exc) from None
-    return [r.text for r in results if r.text]
+    if texts and _looks_complete(texts):
+        return _dedup(texts)
+
+    deadline = time.monotonic() + (RETRY_BUDGET if deep else BATCH_BUDGET)
+    seen = set(texts)
+    baseline = len(texts)
+
+    def _sweep(variants, idle_limit: int = 0) -> tuple[int, bool]:
+        """跑一组变体，返回（新增帧数, 是否超时）。
+
+        ``idle_limit`` 是「连续几次没捞到新帧就放弃」——某一类变体完全无效时
+        不必把所有档位都试完，省下时间去试更有希望的。
+        """
+        gained = 0
+        idle = 0
+        for variant in variants:
+            if time.monotonic() > deadline:
+                return gained, True
+            try:
+                found = [r.text for r in zxingcpp.read_barcodes(variant) if r.text]
+            except Exception:  # noqa: BLE001  某个变体解不动不影响整体
+                continue
+            fresh = [t for t in found if t not in seen]
+            if not fresh:
+                idle += 1
+                if idle_limit and idle >= idle_limit:
+                    return gained, False
+                continue
+            idle = 0
+            seen.update(fresh)
+            texts.extend(fresh)
+            gained += len(fresh)
+            if _looks_complete(texts):
+                return gained, False
+        return gained, False
+
+    # 第一轮只做便宜的像素变换（去水印阈值 / 二值化 / 反色 / 单通道 / 放大）
+    cheap_gain, timed_out = _sweep(_cheap_variants(img), idle_limit=2 if not deep else 5)
+    if not timed_out and not _looks_complete(texts):
+        _sweep(_channel_variants(img), idle_limit=2 if not deep else 3)
+    if timed_out or _looks_complete(texts):
+        return _dedup(texts)
+    # 一批图里的单张不做深挖：缺的帧八成在别的图里
+    if not deep:
+        return _dedup(texts)
+    # 原图已经识别到好几帧、便宜的变换却一帧新东西都没捞着 —— 说明缺的帧压根
+    # 不在这一张图里（跨页总览就是这种情况），再去切块/放大纯属白跑几十秒。
+    # 反过来，原图只认出 0~1 帧说明是整张图质量有问题（码太小、水印太重），
+    # 值得继续拿 3 倍放大和切块死磕。
+    if baseline >= 2 and not cheap_gain:
+        return _dedup(texts)
+    _sweep(_expensive_variants(img))
+    return _dedup(texts)
+
+
+def _looks_complete(texts: list[str]) -> bool:
+    """按段头判断是否已经收全：每个文档都攒够 total 帧才算齐。
+
+    没有段头（普通容器文本、别人的二维码）就当作「无从判断」，不再折腾。
+    """
+    try:
+        segs = ct.parse_segments("\n".join(texts))
+    except Exception:  # noqa: BLE001
+        return True
+    if not segs:
+        return True
+    need: dict[str, int] = {}
+    got: dict[str, set] = {}
+    for seg in segs:
+        need[seg.doc_id] = seg.total
+        got.setdefault(seg.doc_id, set()).add(seg.index)
+    return all(len(got[d]) >= need[d] for d in need)
+
+
+def _otsu(img):
+    """Otsu 自动阈值二值化（纯 PIL，不依赖 numpy）。"""
+    gray = img.convert("L")
+    hist = gray.histogram()
+    total = sum(hist)
+    if not total:
+        return gray
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    best, threshold = -1.0, 128
+    weight_bg = 0
+    sum_bg = 0
+    for level in range(256):
+        weight_bg += hist[level]
+        if not weight_bg:
+            continue
+        weight_fg = total - weight_bg
+        if not weight_fg:
+            break
+        sum_bg += level * hist[level]
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_all - sum_bg) / weight_fg
+        var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if var > best:
+            best, threshold = var, level
+    lut = [255 if v > threshold else 0 for v in range(256)]
+    return gray.point(lut)
+
+
+def _tiles(img, cols: int = 2, overlap: float = 0.12):
+    """带重叠地切片：切断的码靠重叠区在邻块里补回来。"""
+    w, h = img.width, img.height
+    if w < 480 or h < 480:
+        return
+    step_x, step_y = w / cols, h / cols
+    pad_x, pad_y = int(step_x * overlap), int(step_y * overlap)
+    for r in range(cols):
+        for c in range(cols):
+            left = max(0, int(c * step_x) - pad_x)
+            top = max(0, int(r * step_y) - pad_y)
+            right = min(w, int((c + 1) * step_x) + pad_x)
+            bottom = min(h, int((r + 1) * step_y) + pad_y)
+            if right - left < 120 or bottom - top < 120:
+                continue
+            yield img.crop((left, top, right, bottom))
+
+
+#: 固定阈值二值化的候选切点。水印是半透明的浅灰，二维码是纯黑，
+#: 用低阈值把「不够黑」的像素全漂白，水印就被抹掉了；多档是因为水印深浅不可知。
+#: 实测重水印（0.8 不透明度灰字铺满）原像素只能认 0~3 帧，扫一遍切点就能全认回来。
+THRESHOLDS = (60, 80, 100, 120)
+
+
+def _cheap_variants(img):
+    """便宜的像素变换：固定阈值去屏幕水印 → Otsu → 反色 → 单通道 → 2 倍放大。
+
+    屏幕/看图软件叠的水印是半透明浅色，二维码是纯黑；用低阈值把「不够黑」的
+    像素全漂白，水印就没了。多档是因为水印深浅、透明度都不可知。
+    """
+    from PIL import Image
+
+    gray = img.convert("L")
+    for level in THRESHOLDS:
+        yield gray.point([0 if v < level else 255 for v in range(256)])
+    binarized = _otsu(img)
+    yield binarized
+    yield binarized.point(lambda v: 255 - v)
+    if img.width * img.height <= UPSCALE_LIMIT:
+        yield img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+
+
+def _channel_variants(img):
+    """彩色水印（蓝底白字之类）在单通道上往往直接消失，逐通道试一遍。"""
+    if len(img.getbands()) < 3:
+        return
+    for channel in img.split()[:3]:
+        yield channel
+
+
+def _expensive_variants(img):
+    """昂贵的兜底：3 倍放大（小码救命）、中值滤波、重叠切块。"""
+    from PIL import Image, ImageFilter
+
+    pixels = img.width * img.height
+    # 3 倍放大：屏幕上的码被看/缩得很小（每模块不足 2px）时，实测 1/6 → 5/6
+    if pixels * 9 <= UPSCALE_LIMIT * 4:
+        yield img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+    binarized = _otsu(img)
+    if pixels <= UPSCALE_LIMIT * 2:
+        yield binarized.filter(ImageFilter.MedianFilter(3))   # 去细线水印
+    for tile in _tiles(img):
+        yield tile
+        yield _otsu(tile)
 
 
 def decode_images(paths: Iterable[str]) -> list[str]:
@@ -451,8 +651,10 @@ def decode_images(paths: Iterable[str]) -> list[str]:
 
     texts: list[str] = []
     seen = set()
+    # 只有一张图时值得深挖（可能是带水印的总览图）；多张时缺的帧在别的图里
+    deep = len(files) == 1
     for path in files:
-        for text in decode_image(path):
+        for text in decode_image(path, deep=deep):
             if text not in seen:
                 seen.add(text)
                 texts.append(text)

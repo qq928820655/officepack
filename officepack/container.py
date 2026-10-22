@@ -662,12 +662,25 @@ def unpack_sources(
 ) -> list[tuple[str, dict]]:
     """还原一个或多个文件；自动把同一文档的分段合并成一个输出。
 
-    支持：单个完整容器、单个分段文件、多个分段文件、含多段的单个文本文件。
+    支持：单个完整容器、单个分段文件、多个分段文件、含多段的单个文本文件，
+    以及**二维码图片**（扩展名是图片就自动扫码，不再当文本读 —— 以前直接
+    ``open(..., "r")`` 撞上 PNG 会抛 UnicodeDecodeError）。
     """
+    from . import qr as _qr          # 惰性导入：qr 反过来依赖本模块
+
     texts: list[str] = []
+    images: list[str] = []
     for path in paths:
-        with open(path, "r", encoding="utf-8-sig", errors="strict") as fh:
-            texts.append(fh.read())
+        if _qr.is_image_path(path):
+            images.append(path)
+            continue
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="strict") as fh:
+                texts.append(fh.read())
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ContainerError("读取 %s 失败：%s" % (os.path.basename(path), exc)) from None
+    if images:
+        texts.extend(_qr.decode_images(images))
     # 未指定输出目录时，默认写在第一个源文件旁边
     if out_dir is None and paths:
         out_dir = os.path.dirname(os.path.abspath(paths[0]))

@@ -12,6 +12,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from . import clipboard as clip_mod
 from . import container as ct
 from . import codecs as codec_mod
 from . import compress as compress_mod
@@ -315,8 +316,8 @@ class App:
         self.qr_chk.pack(side="left")
         self.qr_fmt_box = ttk.Combobox(qr_row, textvariable=self.qr_format, width=17,
                                        state="readonly",
-                                       values=["PNG（单帧 + 总览）", "GIF 动图",
-                                               "PNG + GIF"])
+                                       values=["PNG（单帧 + 总览）", "PNG（仅总览）",
+                                               "GIF 动图", "PNG + GIF"])
         self.qr_fmt_box.pack(side="left", padx=(8, 0))
         ttk.Entry(qr_row, textvariable=self.qr_fps, width=3).pack(side="left", padx=(6, 0))
         ttk.Label(qr_row, text="帧/秒", style="Hint.TLabel").pack(side="left", padx=(3, 0))
@@ -332,9 +333,11 @@ class App:
 
         self.shot_btn = ttk.Menubutton(right, text="还原二维码 ▾")
         shot_menu = tk.Menu(self.shot_btn, tearoff=False)
-        shot_menu.add_command(label="框选屏幕区域…（推荐）", command=self.grab_region)
+        shot_menu.add_command(label="粘贴识别面板…（贴图/连 Ditto，推荐）",
+                              command=self.paste_unpack)
+        shot_menu.add_command(label="框选屏幕区域…（支持多屏）", command=self.grab_region)
         shot_menu.add_command(label="读取剪贴板截图", command=self.qr_unpack)
-        shot_menu.add_command(label="选择图片文件…",
+        shot_menu.add_command(label="选择图片文件…（可多选）",
                               command=lambda: self.qr_unpack(from_file=True))
         self.shot_btn["menu"] = shot_menu
         self.shot_btn.grid(row=18, column=0, sticky="ew", padx=10, pady=(0, 3))
@@ -577,10 +580,17 @@ class App:
             messagebox.showerror(APP_TITLE, "无法打开文件夹：\n%s\n\n%s" % (path, exc))
 
     def paste_unpack(self):
-        """手动粘贴容器文本还原：完整容器、单个分片、多个分片混在一起都支持。"""
+        """粘贴识别面板：贴图（可多张、可连 Ditto）、贴文本，累积后一次还原。
+
+        为什么是「面板」而不是「读一次剪贴板就还原」：多帧二维码常常分散在好几张
+        截图里，而剪贴板一次只拿得到最上面那张。面板把每次识别到的帧累积起来，
+        最后一次性还原 —— 顺序完全无所谓（分段自带序号，缺帧会明确告诉你缺第几帧）。
+        """
+        clip = clip_mod
+
         dlg = tk.Toplevel(self.root)
-        dlg.title("粘贴文本还原")
-        self._size_dialog(dlg, 840, 580, 620, 420)
+        dlg.title("粘贴识别面板")
+        self._size_dialog(dlg, 880, 620, 660, 460)
         dlg.transient(self.root)
         try:
             dlg.grab_set()
@@ -588,8 +598,10 @@ class App:
             pass
 
         ttk.Label(
-            dlg,
-            text="把容器文本粘到下面：完整容器 / 单个分片 / 多个分片混在一起（顺序随意）都支持。",
+            dlg, justify="left", wraplength=820,
+            text="① 复制一张二维码截图 → 在下面 Ctrl+V，可反复多次（帧会累积）\n"
+                 "② 装了 Ditto：点「打开 Ditto 剪贴板」，在 Ditto 里双击要用的图，会自动贴进来\n"
+                 "③ 也可以直接把容器文本 / 分片粘进来（顺序随意）",
         ).pack(anchor="w", padx=12, pady=(12, 4))
 
         wrap = ttk.Frame(dlg)
@@ -600,103 +612,258 @@ class App:
         vsb.pack(side="right", fill="y")
         box.pack(side="left", fill="both", expand=True)
 
-        hint = ttk.Label(dlg, text="", justify="left", wraplength=780)
+        hint = ttk.Label(dlg, text="", justify="left", wraplength=820)
         hint.pack(anchor="w", padx=12, pady=(6, 0))
 
         bar = ttk.Frame(dlg)
         bar.pack(fill="x", padx=12, pady=10)
 
-        def inspect():
-            text = box.get("1.0", "end-1c")
-            if not text.strip():
-                hint.configure(text="")
-                return
-            try:
-                info = ct.inspect_text(text)
-            except ct.ContainerError as exc:
-                hint.configure(text="✗ %s" % exc, foreground="#c00")
-                return
-            total = info.get("segments_total")
-            if total:
-                got = info.get("segments_received", 0)
-                miss = info.get("segments_missing") or []
-                if miss:
-                    hint.configure(
-                        text="共 %d 段，已收 %d 段，缺第 %s 段"
-                             % (total, got, "、".join(str(i) for i in miss)),
-                        foreground="#c60")
-                else:
-                    hint.configure(text="共 %d 段，已全部收到，可以还原" % total,
-                                   foreground="#0a7")
-            else:
-                hint.configure(
-                    text="完整容器：%s（%s）"
-                         % (info.get("name"), _human(info.get("size") or 0)),
-                    foreground="#0a7")
+        known: set[str] = set()      # 已收帧，避免同一张图贴两次重复堆积
 
-        def from_clipboard():
-            try:
-                data = dlg.clipboard_get()
-            except tk.TclError:
-                hint.configure(text="剪贴板里没有文本", foreground="#c00")
-                return
+        def append_text(chunk: str) -> None:
             if box.get("1.0", "end-1c").strip():
                 box.insert("end", "\n")
-            box.insert("end", data)
-            inspect()
+            box.insert("end", chunk)
+            box.see("end")
+
+        def refresh(*_args):
+            """统计面板里现在攒了什么：共几帧、缺哪几帧。"""
+            text = box.get("1.0", "end-1c")
+            if not text.strip():
+                hint.configure(text="", foreground="#666")
+                return
+            try:
+                segs = ct.parse_segments(text)
+            except Exception:  # noqa: BLE001
+                segs = []
+            if not segs:
+                try:
+                    info = ct.inspect_text(text)
+                except ct.ContainerError:
+                    hint.configure(text="暂时看不出是容器文本，点「还原」试试", foreground="#666")
+                    return
+                hint.configure(text="完整容器：%s（%s）"
+                                    % (info.get("name"), _human(info.get("size") or 0)),
+                               foreground="#0a7")
+                return
+            need, got, parts, complete = {}, {}, [], True
+            for seg in segs:
+                need[seg.doc_id] = seg.total
+                got.setdefault(seg.doc_id, set()).add(seg.index)
+            for doc_id, total in need.items():
+                have = len(got.get(doc_id, ()))
+                missing = [i for i in range(1, total + 1) if i not in got.get(doc_id, ())]
+                complete = complete and not missing
+                parts.append("共 %d 帧，已收 %d 帧%s"
+                             % (total, have,
+                                "" if not missing
+                                else "，缺第 %s 帧" % "、".join(str(i) for i in missing)))
+            hint.configure(
+                text="；".join(parts) + ("　✔ 可以还原" if complete else "　继续贴图补帧"),
+                foreground="#0a7" if complete else "#c60")
+
+        def absorb(images, label: str) -> int:
+            """识别一批图，把新帧追加进面板；返回新增帧数。"""
+            added = 0
+            deep = len(images) == 1
+            for idx, img in enumerate(images, 1):
+                try:
+                    found = qr.decode_image(img, deep=deep)
+                except Exception as exc:  # noqa: BLE001  单张坏了不影响其它
+                    self._log("✗ %s 第 %d 张识别失败：%s" % (label, idx, exc))
+                    continue
+                fresh = [t for t in found if t not in known]
+                if fresh:
+                    known.update(fresh)
+                    append_text("\n".join(fresh))
+                    added += len(fresh)
+                if len(images) > 1:
+                    self._log("· %s第 %d 张：识别 %d 段，新增 %d 段"
+                              % (label, idx, len(found), len(fresh)))
+            return added
+
+        def take_paths(paths) -> int:
+            from PIL import Image
+
+            images = []
+            for path in paths:
+                try:
+                    with Image.open(path) as im:
+                        images.append(im.convert("RGB"))
+                except Exception as exc:  # noqa: BLE001
+                    self._log("✗ 打不开 %s：%s" % (os.path.basename(path), exc))
+            if not images:
+                hint.configure(text="这些文件都打不开", foreground="#c00")
+                return 0
+            added = absorb(images, "%d 张图片" % len(images))
+            refresh()
+            return added
+
+        def take_clipboard(verbose: bool = True) -> int:
+            """读剪贴板：优先图，其次文件，最后才当文本。"""
+            snap = clip.snapshot()
+            images = list(snap["images"])
+            paths = [p for p in snap["files"] if qr.is_image_path(p)]
+            added = 0
+            if images:
+                added += absorb(images, "剪贴板截图")
+            if paths:
+                added += take_paths(paths)
+            if not images and not paths:
+                if (snap["text"] or "").strip():
+                    append_text(snap["text"].strip())
+                    added += 1
+                elif verbose:
+                    names = "、".join(snap["formats"][:6]) or "空"
+                    hint.configure(
+                        text="剪贴板里没有图（当前格式：%s）。"
+                             "用 Win+Shift+S 或 Ditto 重新复制一张再试" % names,
+                        foreground="#c60")
+            refresh()
+            return added
+
+        def on_paste(_event=None):
+            """Ctrl+V：剪贴板里是图就自己消化，是文本就交给默认粘贴。"""
+            try:
+                snap = clip.snapshot()
+            except Exception:  # noqa: BLE001
+                return None
+            if snap["images"] or [p for p in snap["files"] if qr.is_image_path(p)]:
+                take_clipboard()
+                return "break"
+            return None
+
+        box.bind("<<Paste>>", on_paste)
+
+        def pick_files():
+            chosen = filedialog.askopenfilenames(
+                parent=dlg, title="选择二维码截图（可多选，顺序随意）",
+                filetypes=[("图片", " ".join("*" + e for e in qr.IMAGE_EXTS)),
+                           ("所有文件", "*.*")],
+            )
+            if chosen:
+                take_paths(list(chosen))
+
+        def open_ditto():
+            ok, msg = clip.open_ditto()
+            hint.configure(text=msg, foreground="#0a7" if ok else "#c60")
+            self._log(("· " if ok else "✗ ") + msg)
 
         def clear_all():
             box.delete("1.0", "end")
-            hint.configure(text="")
+            known.clear()
+            hint.configure(text="", foreground="#666")
 
         def do_unpack():
             text = box.get("1.0", "end-1c")
             if not text.strip():
-                messagebox.showwarning("提示", "文本框是空的", parent=dlg)
+                messagebox.showwarning("提示", "面板是空的：先贴一张二维码截图",
+                                       parent=dlg)
                 return
             password = self.password.get() or None
+            if password is None:
+                try:
+                    cipher = ct.inspect_text(text).get("cipher") or {}
+                except ct.ContainerError:
+                    cipher = {}
+                if cipher.get("alg", "none") != "none":
+                    messagebox.showwarning(
+                        "需要口令", "这份内容是加密的，请先在主界面的「口令」里填写",
+                        parent=dlg)
+                    return
             try:
-                info = ct.inspect_text(text)
-            except ct.ContainerError as exc:
-                messagebox.showerror("无法解析", str(exc), parent=dlg)
-                return
-            if (info.get("cipher") or {}).get("alg", "none") != "none" and not password:
-                messagebox.showwarning(
-                    "需要口令", "这份文本是加密的，请先在主界面的「口令」里填写", parent=dlg)
-                return
-            out_dir = self.out_dir.get().strip() or None
-            try:
-                path, meta = ct.unpack_pasted(text, out_dir, password)
+                results = self._unpack_frames([text], "粘贴面板")
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("还原失败", str(exc), parent=dlg)
                 return
-            self._log("✅ 粘贴还原 → %s" % path)
-            self._log("   %s，SHA-256 校验通过 %s…"
-                      % (_human(meta["size"]), meta["sha256"][:16]))
             dlg.destroy()
-            self._finish({"ok": 1, "fail": 0, "outputs": [path], "errors": []})
+            self._finish({"ok": len(results), "fail": 0,
+                          "outputs": [p for p, _ in results], "errors": []})
 
-        ttk.Button(bar, text="从剪贴板粘贴", command=from_clipboard).pack(side="left")
-        ttk.Button(bar, text="检查分片", command=inspect).pack(side="left", padx=6)
-        ttk.Button(bar, text="清空", command=clear_all).pack(side="left")
+        if not clip.ditto_path():
+            self._log("· 没检测到 Ditto，用 Win+Shift+S 截图后 Ctrl+V 也一样")
+
+        ttk.Button(bar, text="读剪贴板", command=take_clipboard).pack(side="left")
+        ttk.Button(bar, text="打开 Ditto 剪贴板", command=open_ditto).pack(
+            side="left", padx=6)
+        ttk.Button(bar, text="选图片文件…", command=pick_files).pack(side="left")
+        ttk.Button(bar, text="清空", command=clear_all).pack(side="left", padx=6)
         ttk.Button(bar, text="关闭", command=dlg.destroy).pack(side="right")
         ttk.Button(bar, text="还原", style="Go.TButton",
                    command=do_unpack).pack(side="right", padx=6)
 
         box.focus_set()
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        refresh()
+
+    def _cursor_monitor(self) -> tuple[int, int, int, int]:
+        """鼠标所在显示器的矩形（虚拟桌面坐标；主屏左侧的副屏会是负坐标）。
+
+        Tk 的 winfo_screenwidth/height 只给主屏尺寸，拿它铺遮罩的话副屏就成了
+        「点不到、也框不了」的死角。这里直接问系统要鼠标踩在哪块屏上。
+        """
+        fallback = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                            ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+            point = wt.POINT()
+            if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+                return fallback
+            handle = ctypes.windll.user32.MonitorFromPoint(point, 0)   # NEAREST
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if handle and ctypes.windll.user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+                rect = info.rcMonitor
+                if rect.right - rect.left > 100 and rect.bottom - rect.top > 100:
+                    return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:  # noqa: BLE001  非 Windows / 老系统
+            pass
+        return fallback
+
+    @staticmethod
+    def _place_overlay(top, left: int, top_y: int, width: int, height: int) -> None:
+        """把遮罩窗口精确摆到指定屏幕（支持负坐标，Tk 的 geometry 不一定认）。"""
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                            wt.UINT]
+            hwnd = top.winfo_id()
+            frame = user32.GetParent(hwnd) or hwnd
+            # HWND_TOPMOST = -1, SWP_SHOWWINDOW = 0x0040
+            if user32.SetWindowPos(frame, wt.HWND(-1), left, top_y,
+                                   width, height, 0x0040):
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            top.geometry("%dx%d+%d+%d" % (width, height, left, top_y))
+        except tk.TclError:
+            pass
 
     def grab_region(self):
-        """全屏框选一块区域 → 截图 → 识别二维码 → 直接还原。
+        """框选屏幕区域 → 截图 → 识别二维码 → 直接还原。
 
         比「先截图存文件再选文件」少两步：屏幕上有码，拖一个框就完事。
-        多屏时只框当前屏幕（Tk 的 winfo_screenwidth 是主屏尺寸）。
+        **多屏**：遮罩铺在鼠标所在的那块屏幕上（主屏/副屏都行），
+        抓图按虚拟桌面坐标取，副屏在左边导致的负坐标也照常工作。
         """
         try:
             from PIL import ImageGrab
         except Exception as exc:  # 没有 Pillow
             messagebox.showerror(APP_TITLE, "缺少 Pillow，无法截图：%s" % exc)
             return
+
+        ml, mt, mr, mb = self._cursor_monitor()
+        sw, sh = mr - ml, mb - mt
 
         top = tk.Toplevel(self.root)
         top.overrideredirect(True)
@@ -705,7 +872,6 @@ class App:
             top.attributes("-alpha", 0.30)      # 半透明遮罩，能看见底下的码
         except tk.TclError:
             pass
-        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
         top.geometry("%dx%d+0+0" % (sw, sh))
         top.configure(bg="black")
 
@@ -713,6 +879,8 @@ class App:
         canvas.pack(fill="both", expand=True)
         canvas.create_text(sw // 2, 40, fill="white", font=("Microsoft YaHei UI", 14),
                            text="拖框圈住二维码 · 松开即识别 · Esc 取消")
+        top.update_idletasks()
+        self._place_overlay(top, ml, mt, sw, sh)
 
         box = {"x0": 0, "y0": 0, "rect": None}
 
@@ -728,14 +896,14 @@ class App:
         def on_release(e):
             x1, x2 = sorted((box["x0"], e.x))
             y1, y2 = sorted((box["y0"], e.y))
-            ox, oy = canvas.winfo_rootx(), canvas.winfo_rooty()
             top.destroy()
             if x2 - x1 < 24 or y2 - y1 < 24:      # 误点一下，当取消
                 return
             self.root.configure(cursor="watch")
             self.root.update_idletasks()
             try:
-                img = ImageGrab.grab(bbox=(ox + x1, oy + y1, ox + x2, oy + y2),
+                # 遮罩的客户区原点 = 该屏左上角，加上屏幕偏移就是虚拟桌面坐标
+                img = ImageGrab.grab(bbox=(ml + x1, mt + y1, ml + x2, mt + y2),
                                      all_screens=True)
                 self._unpack_qr_image(img, "屏幕框选")
             except Exception as exc:  # noqa: BLE001
@@ -751,12 +919,64 @@ class App:
         top.bind("<Escape>", lambda _e: top.destroy())
         top.focus_force()
 
-    def _unpack_qr_image(self, img, source: str):
-        """把一张 PIL 图里的二维码全部识别出来并还原。"""
-        texts = qr.decode_image(img)
+    def _missing_frames(self, texts) -> str:
+        """按段头算还缺哪些帧，返回一句人话（齐了就返回空串）。"""
+        try:
+            segs = ct.parse_segments("\n".join(texts))
+        except Exception:  # noqa: BLE001
+            return ""
+        if not segs:
+            return ""
+        need, got = {}, {}
+        for seg in segs:
+            need[seg.doc_id] = seg.total
+            got.setdefault(seg.doc_id, set()).add(seg.index)
+        notes = []
+        for doc_id, total in need.items():
+            missing = [i for i in range(1, total + 1) if i not in got.get(doc_id, set())]
+            if missing:
+                notes.append("共 %d 帧，已收 %d，缺第 %s 帧"
+                             % (total, total - len(missing),
+                                "、".join(str(i) for i in missing)))
+        return "；".join(notes)
+
+    def _unpack_qr_image(self, images, source: str):
+        """把一张（或一批）PIL 图里的二维码全部识别出来并还原。"""
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+        texts: list[str] = []
+        seen: set[str] = set()
+        deep = len(images) == 1       # 只有一张图时才值得深挖
+        for idx, img in enumerate(images, 1):
+            try:
+                found = qr.decode_image(img, deep=deep)
+            except Exception as exc:  # noqa: BLE001  一张坏了不该拖垮整批
+                self._log("✗ 第 %d 张识别失败：%s" % (idx, exc))
+                continue
+            fresh = [t for t in found if t not in seen]
+            seen.update(fresh)
+            texts.extend(fresh)
+            if len(images) > 1:
+                self._log("· 第 %d/%d 张：识别 %d 段，其中新增 %d 段"
+                          % (idx, len(images), len(found), len(fresh)))
         if not texts:
             raise qr.QRError("这块区域里没有识别到完整的二维码。\n"
                              "请把码整个圈进去，别切掉边角，也别缩得太小。")
+        results = self._unpack_frames(texts, source)
+        if messagebox.askyesno(
+            APP_TITLE,
+            "已从%s还原 %d 个文件\n\n%s\n\n打开所在文件夹？"
+            % (source, len(results), self.last_out_dir),
+        ):
+            self.open_out_dir()
+
+    def _unpack_frames(self, texts, source: str, parent=None):
+        """帧文本 → 文件（顺序无关，缺帧会提示），返回 [(路径, meta)]。"""
+        missing = self._missing_frames(texts)
+        if missing:
+            self._log("· %s：%s" % (source, missing))
+            self._log("   补帧办法：把二维码放大显示（100% 或全屏）再截一张，"
+                      "或用「粘贴识别面板」一张张累加，顺序随意")
         password = self.password.get() or None
         out_dir = self.out_dir.get().strip() or None
         results = ct.unpack_texts(texts, out_dir, password)
@@ -764,74 +984,69 @@ class App:
         names = "、".join(os.path.basename(p) for p, _ in results[:5])
         self._log("✅ 从%s识别 %d 帧 → 还原 %d 个文件：%s"
                   % (source, len(texts), len(results), names))
-        if messagebox.askyesno(
-            APP_TITLE,
-            "已从%s还原 %d 个文件\n\n%s\n\n打开所在文件夹？"
-            % (source, len(results), self.last_out_dir),
-        ):
-            self.open_out_dir()
+        for path, meta in results:
+            self._log("   %s  %s，SHA-256 %s…"
+                      % (os.path.basename(path), _human(meta["size"]),
+                         meta["sha256"][:16]))
+        return results
 
     def qr_unpack(self, from_file: bool = False):
-        """从截图还原：优先读剪贴板里的截图，取不到再让人选图片文件。"""
-        paths: list[str] = []
-        inline = None
+        """从截图还原：优先读剪贴板里的截图（含 Ditto 放进去的 CF_DIB），
+        取不到再让人选图片文件。多图会**全部**识别后合并，不是只认最后一张。
+        """
+        clip = clip_mod
+
+        source = ""
+        images: list = []
+        chosen: list[str] | None = None
         if not from_file:
-            try:
-                from PIL import ImageGrab
+            snap = clip.snapshot()
+            images = list(snap["images"])
+            file_paths = [p for p in snap["files"] if qr.is_image_path(p)]
+            if images:
+                source = "剪贴板截图"
+            elif file_paths:
+                chosen = file_paths
+            else:
+                names = "、".join(snap["formats"][:6]) or "空"
+                self._log("· 剪贴板里没有图（当前格式：%s）" % names)
 
-                clip = ImageGrab.grabclipboard()
-            except Exception:  # 没有 Pillow / 剪贴板读不到
-                clip = None
+        if not images:
+            if chosen is None:
+                chosen = filedialog.askopenfilenames(
+                    title="选择二维码截图（可多选，顺序随意）",
+                    filetypes=[("图片", " ".join("*" + e for e in qr.IMAGE_EXTS)),
+                               ("所有文件", "*.*")],
+                )
+            paths = list(chosen or ())
+            if not paths:
+                return
+            from PIL import Image
 
-            if isinstance(clip, list):
-                paths = [p for p in clip if qr.is_image_path(p)]
-            elif clip is not None:
-                inline = clip          # 剪贴板里直接就是一张图
+            for path in paths:
+                try:
+                    with Image.open(path) as im:
+                        images.append(im.convert("RGB"))
+                except Exception as exc:  # noqa: BLE001
+                    self._log("✗ 打不开 %s：%s" % (os.path.basename(path), exc))
+            source = "%d 张图片" % len(paths)
 
-        if inline is None and not paths:
-            chosen = filedialog.askopenfilenames(
-                title="选择二维码截图（可多选）",
-                filetypes=[("图片", " ".join("*" + e for e in qr.IMAGE_EXTS)),
-                           ("所有文件", "*.*")],
-            )
-            paths = list(chosen)
-        if inline is None and not paths:
+        if not images:
+            messagebox.showwarning(APP_TITLE,
+                                   "没读到任何图片。可以试试「粘贴识别面板」，"
+                                   "它能把多次截图累积到一起还原。")
             return
 
         self.root.configure(cursor="watch")
         self.root.update_idletasks()
         try:
-            if inline is not None:
-                texts = qr.decode_image(inline)
-                if not texts:
-                    raise qr.QRError("剪贴板里的图片没有识别到二维码，"
-                                     "请让整张码完整进入截图、不要缩小")
-                source = "剪贴板截图"
-            else:
-                texts = qr.decode_images(paths)
-                source = "%d 张图片" % len(paths)
-            password = self.password.get() or None
-            out_dir = self.out_dir.get().strip() or None
-            results = ct.unpack_texts(texts, out_dir, password)
-        except Exception as exc:
+            self._unpack_qr_image(images, source)
+        except Exception as exc:  # noqa: BLE001
             messagebox.showerror(APP_TITLE, "截图还原失败：\n%s" % exc)
             self._log("✗ 截图还原失败：%s" % exc)
-            return
         finally:
             self.root.configure(cursor="")
             self.root.update_idletasks()
-
-        for path, meta in results:
-            self._log("✅ 截图还原 → %s\n   %d 字节，SHA-256 校验通过 %s…"
-                      % (path, meta["size"], meta["sha256"][:16]))
-        self.last_out_dir = os.path.dirname(results[0][0])
-        self._log("来源 %s，输出文件夹：%s" % (source, self.last_out_dir))
-        if messagebox.askyesno(
-            APP_TITLE,
-            "已从%s还原 %d 个文件\n\n%s\n\n打开所在文件夹？"
-            % (source, len(results), self.last_out_dir),
-        ):
-            self.open_out_dir()
 
     def _on_preset(self, _event=None):
         label = self.preset.get()
@@ -1061,15 +1276,14 @@ class App:
         errors: list[str] = []
 
         if mode == "unpack":
-            # 分段必须整体合并还原，不能逐个文件处理；二维码图片自动扫码
+            # 分段必须整体合并还原，不能逐个文件处理；图片和文本混着给也能一起还原
             try:
-                has_image = any(qr.is_image_path(f) for f in files)
-                if has_image:
-                    results, stats = qr.unpack_any(files, out_dir, password)
+                results, stats = qr.unpack_any(files, out_dir, password)
+                if stats["images"]:
                     self.queue.put(("log",
-                        "· 从 %d 张图片扫回 %d 段内容" % (stats["images"], stats["blocks"])))
-                else:
-                    results = ct.unpack_sources(files, out_dir, password)
+                        "· %d 张图片扫回 %d 段 + %d 个文本容器 → 合并还原"
+                        % (stats["images"], stats["blocks"] - stats["texts"],
+                           stats["texts"])))
                 for path, meta in results:
                     outputs.append(path)
                     ok += 1
@@ -1136,11 +1350,13 @@ class App:
         frames = qr.build_frames(pack, ec=qr.DEFAULT_EC)
         target_dir = out_dir or os.path.dirname(os.path.abspath(src))
         want_png = qr_format.startswith("PNG") or "+" in qr_format
+        want_single = "仅总览" not in qr_format
         want_gif = "GIF" in qr_format and len(frames) > 1
 
         res = {"images": [], "sheet": None, "sheets": [], "dir": target_dir}
         if want_png:
-            res = qr.render_images(frames, target_dir, name, ec=qr.DEFAULT_EC, sheet=True)
+            res = qr.render_images(frames, target_dir, name, ec=qr.DEFAULT_EC,
+                                   sheet=True, single=want_single)
             outputs.extend(res["images"])
             outputs.extend(res.get("sheets") or [])
 

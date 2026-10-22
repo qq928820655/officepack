@@ -15,7 +15,7 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DIST = os.path.join(ROOT, "dist")
+DIST = os.environ.get("OFFICEPACK_DIST") or os.path.join(ROOT, "dist")
 PREV = os.path.join(ROOT, "dist_prev")
 NAMES = ("OfficePack-GUI", "officepack")
 

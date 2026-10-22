@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 
 try:
@@ -140,7 +141,7 @@ class LayoutTest(unittest.TestCase):
     def test_scan_buffer_accumulates_frames(self):
         """两次框选要能累加：漏帧时再框一次就补上，不必从头来。"""
         part = ["#OPK1 aaa 001/002 x 10\nAAA"]
-        self.assertIn("缺第 2 帧", self.app._missing_frames(part))
+        self.assertIn("第 2 帧", self.app._missing_frames(part))
         merged = part + ["#OPK1 aaa 002/002 x 10\nBBB"]
         self.assertEqual(self.app._missing_frames(merged), "")
 
@@ -211,6 +212,28 @@ class LayoutTest(unittest.TestCase):
         self.assertIn("PNG（仅总览）", values)
         self.assertIn("PNG（单帧 + 总览）", values)
 
+    def test_qr_format_offers_webp_only(self):
+        """WebP 也要能**单独**出，不能只能跟 GIF 绑在一起。"""
+        values = self.app.qr_fmt_box.cget("values")
+        self.assertIn("WebP 动图", values)
+        self.assertIn("GIF + WebP", values)
+
+    def test_single_frame_with_anim_format_still_writes_something(self):
+        """选了「WebP 动图」但文件一帧就装下时，不能一个产物都不写。"""
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="opk-single-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, True))
+        src = os.path.join(tmp, "small.txt")
+        with open(src, "wb") as fh:
+            fh.write(b"tiny")            # 一帧就装得下
+        outputs: list[str] = []
+        self.app._pack_one_qr(src, "small.txt", tmp, None, "none", "auto",
+                              "qr45", outputs, "WebP 动图", "3")
+        self.assertTrue(outputs, "选了动图格式 + 单帧 ＝ 什么都没输出")
+        self.assertTrue(any(p.endswith(".png") for p in outputs),
+                        "单帧应当回落成 PNG，而不是硬塞一个动图")
+
     def test_paste_panel_opens_and_recovers(self):
         """粘贴识别面板要能开出来（含 Ditto 按钮），关掉后不留残窗。"""
         before = set(self.root.winfo_children())
@@ -269,6 +292,98 @@ class LayoutTest(unittest.TestCase):
         self.assertGreater(phys[0], 1536, "换算后仍在主屏范围，等于没换算")
         self.assertEqual(self.app._scale_bbox(box, 1.0), box,
                          "scale=1 时不该动坐标")
+
+    def test_frame_ranges_are_compressed(self):
+        """978 帧缺 700 个时，逐个列是一千多字符的流水账，要压成区间。"""
+        nums = list(range(1, 119)) + list(range(209, 548))
+        from officepack.gui import _frame_ranges
+
+        self.assertEqual(_frame_ranges(nums), "1–118、209–547")
+        self.assertEqual(_frame_ranges([5]), "5")
+        self.assertTrue(_frame_ranges([]) == "")
+        many = sum((list(range(i * 10, i * 10 + 3)) for i in range(12)), [])
+        self.assertIn("等", _frame_ranges(many), "段数太多时应当截断")
+
+    def test_eta_is_said_in_human_words(self):
+        """「这得识别到什么时候」—— 角落的小条必须给出人话版的剩余时间。"""
+        from officepack.gui import _fmt_eta
+
+        self.assertEqual(_fmt_eta(None), "正在估时")
+        self.assertEqual(_fmt_eta(1.2), "就快好了")
+        self.assertEqual(_fmt_eta(41), "还要 41 秒")
+        self.assertEqual(_fmt_eta(100), "还要 1 分 40 秒")
+        self.assertEqual(_fmt_eta(600), "还要约 10 分钟")
+
+    def test_scan_fps_follows_the_render_setting(self):
+        """识别时按界面上的「帧/秒」估算，别拿写死的 3 帧/秒硬套。
+
+        屏幕上那段 GIF 就是本程序按这个帧率生成的，两者必须对得上 —— 对不上
+        就会算错「播一轮要多久」。
+        """
+        self.app.qr_fps.set("6")
+        self.assertAlmostEqual(self.app._scan_fps(), 6.0)
+        self.app.qr_fps.set("abc")           # 手滑打错不能崩
+        self.assertAlmostEqual(self.app._scan_fps(), 3.0)
+        self.app.qr_fps.set("0")             # 0 帧/秒没有意义
+        self.assertAlmostEqual(self.app._scan_fps(), 0.5)
+        self.app.qr_fps.set("3")
+
+    def test_replay_button_reuses_last_region(self):
+        """补录几十个帧不该再拖一次框 —— 记住上次区域，一键重扫。"""
+        self.app._last_phys = (100, 200, 600, 700)
+        self.app._show_rescan(True)
+        self.root_update()
+        self.assertTrue(self.app.replay_btn.winfo_ismapped(),
+                        "有上次区域时应当能「再来一轮」")
+        self.assertTrue(self.app.rescan_btn.winfo_ismapped())
+        self.app._show_rescan(False)
+        self.root_update()
+        self.assertFalse(self.app.replay_btn.winfo_ismapped())
+        self.assertFalse(self.app.rescan_btn.winfo_ismapped())
+
+    def root_update(self):
+        try:
+            self.root.update()
+        except tk.TclError:
+            pass
+
+    def test_gdi_grabber_reads_a_real_code(self):
+        """GDI 只抓框内那块（比 ImageGrab 快 4 倍），但必须抓对位置。"""
+        import time as _t
+
+        from PIL import ImageGrab, ImageTk
+
+        if not hasattr(gui_mod, "_make_grabber"):
+            self.skipTest("没有 GDI 抓图实现")
+        pack = qr.ct.pack_bytes(b"gdi grabber " * 40, "g.bin", codec_name="qr45",
+                                compress="none", cipher_name="none", preview=False)
+        frames = qr.build_frames(pack, "L")
+        img = qr._render_uniform(frames[:1], "L", 400)[0]
+        vx, vy, vw, vh = self.app._virtual_screen()
+        px, py, side = vw // 2 + 40, 60, 400
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.geometry("%dx%d+%d+%d" % (side, side, px, py))
+        lbl = tk.Label(win, bg="white")
+        lbl.pack(fill="both", expand=True)
+        photo = ImageTk.PhotoImage(img)
+        lbl.configure(image=photo)
+        self.root.update()
+        _t.sleep(0.4)
+        self.root.update()
+        try:
+            scale = self.app._grab_scale(ImageGrab)
+            bbox = self.app._scale_bbox((px, py, px + side, py + side), scale)
+            grab = gui_mod._make_grabber(bbox)
+            if grab is None:
+                self.skipTest("这台机器 GDI 抓图不可用")
+            shot = grab()
+            self.assertEqual(shot.size, (bbox[2] - bbox[0], bbox[3] - bbox[1]))
+            self.assertTrue(qr.decode_image(shot, deep=False),
+                            "GDI 抓到的画面里没有码 —— 坐标空间搞错了")
+        finally:
+            win.destroy()
+            self.root.update()
 
     def test_scan_keeps_last_frame_for_diagnosis(self):
         """扫描没认出东西时要留下最后一张画面，否则「识别不了」无从定位。"""

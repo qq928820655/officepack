@@ -232,9 +232,15 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
         stem = os.path.basename(src)
         tick = _progress()
         try:
-            res = qr.render_images(frames, target_dir, stem, ec=args.qr_ec,
-                                   sheet=not args.no_sheet, target_px=args.qr_px,
-                                   single=not args.no_single, progress=tick)
+            # --qr-webp 配 --no-single --no-sheet = 只要一张动图 WebP，不写 PNG。
+            # 但只有 1 帧时没有「动」可言，得回落到单帧 PNG，否则一个产物都没有。
+            only_anim = (bool(args.qr_webp or args.qr_gif) and args.no_single
+                         and args.no_sheet and len(frames) > 1)
+            res = {"images": [], "sheet": None, "sheets": [], "dir": target_dir}
+            if not only_anim:
+                res = qr.render_images(frames, target_dir, stem, ec=args.qr_ec,
+                                       sheet=not args.no_sheet, target_px=args.qr_px,
+                                       single=not args.no_single, progress=tick)
             gif_path = None
             webp_path = None
             fps = args.qr_gif or 3.0

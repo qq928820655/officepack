@@ -27,7 +27,7 @@ import time
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DIST = os.path.join(ROOT, "dist")
+DIST = os.environ.get("OFFICEPACK_DIST") or os.path.join(ROOT, "dist")
 CLI = os.path.join(DIST, "officepack", "officepack.exe")
 GUI = os.path.join(DIST, "OfficePack-GUI", "OfficePack-GUI.exe")
 #: 每轮验证开一个独立目录，跑完不删 —— 沙箱对「一次删几十个文件」有保护，

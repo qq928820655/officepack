@@ -20,6 +20,10 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+#: 产物目录。留空就用 ``dist``；用环境变量可以指到别处 —— Windows 上正在运行
+#: 的那个 exe 会锁住它所在的目录（连改名都不行），换目录构建就不用去动用户
+#: 手上正开着的那一份。
+DIST = os.environ.get("OFFICEPACK_DIST") or os.path.join(ROOT, "dist")
 
 #: (相对 _internal 的路径, 类型 "file"/"dir"/"glob", 为什么可以删)
 RULES: list[tuple[str, str, str]] = [
@@ -168,7 +172,7 @@ def main() -> int:
     total_before = total_after = 0
     for name in ("OfficePack-GUI", "officepack"):
         print("\n[%s]" % name)
-        internal = os.path.join(ROOT, "dist", name, "_internal")
+        internal = os.path.join(DIST, name, "_internal")
         before, after = trim_bundle(internal, dry)
         if before:
             total_before += before

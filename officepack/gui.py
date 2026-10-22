@@ -139,6 +139,9 @@ HELP: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
             ("GIF + WebP", "两种动图都出。WebP 是**无损**的，体积约为 GIF 的 1/5。\n"
                           "代价：能播动图 WebP 的软件比 GIF 少（Windows「照片」、\n"
                           "微信可能只显示第一帧）。先确认你的播放器能循环播放它再选这项。" ),
+            ("WebP 动图", "**只出**一张无损动图 WebP，不出 PNG、不出 GIF。\n"
+                         "体积最小（约为 GIF 的 1/5），但播放兼容性最差；\n"
+                         "播放器只显示第一帧的话，扫码就只会拿到那一帧。" ),
             ("帧/秒", "动图播放速度。太快手机跟不上会更漏帧，太慢要等太久；3 最好用。"),
             ("back", "还原：点「还原二维码 → 框选屏幕区域」，拖框圈住码，松开就连拍识别；\n"
                      "动图请让它一直在框里循环播放 —— 同一块区域会连拍到你收齐为止，\n"
@@ -169,6 +172,9 @@ class App:
         self.last_out_dir: str | None = None   # 上一轮实际写出文件的目录
         self._scan_texts: list[str] = []       # 框选连拍的累计帧（多次框选可续上）
         self._scan_cancelled = False
+        self._scan_active = False              # 扫描进行中：主窗口要一直藏着
+        self._last_phys = None                 # 上次框选的物理坐标：再来一轮不用重框
+        self._hud = None                       # 扫描期间的小悬浮条
         self._log_lines = 6                    # 日志框行数，屏幕不够时会被自动压缩
         self._poll_id: str | None = None       # 队列轮询的 after id
         # 当前文件内部的进度（第几张码 / 第几张图）。大文件出码是几百帧的活，
@@ -332,7 +338,7 @@ class App:
         self.qr_fmt_box = ttk.Combobox(qr_row, textvariable=self.qr_format, width=17,
                                        state="readonly",
                                        values=["PNG（单帧 + 总览）", "PNG（仅总览）",
-                                               "GIF 动图", "GIF + WebP",
+                                               "GIF 动图", "WebP 动图", "GIF + WebP",
                                                "PNG + GIF", "PNG + GIF + WebP"])
         self.qr_fmt_box.pack(side="left", padx=(8, 0))
         ttk.Entry(qr_row, textvariable=self.qr_fps, width=3).pack(side="left", padx=(6, 0))
@@ -381,9 +387,63 @@ class App:
         self.sub_progress.pack(side="left", fill="x", expand=True)
         self.prog_text = ttk.Label(sub, text="", foreground="#0a58ca", width=34, anchor="e")
         self.prog_text.pack(side="left", padx=(8, 0))
+        # 缺帧时出现的「继续框选」：明确告诉用户这是**接着收同一份文件**，
+        # 而不是又开一次不知底细的框选（两次框选是同一份还是另一份，以前只能猜）。
+        # 缺帧时出现的两个按钮：一个**还是那块区域**再来一轮（不用重新拖框，
+        # 框歪了才会想重框），一个重新框。以前只有后者，补录几个帧也要重新拖一次，
+        # 拖歪一点又是白扫一轮。
+        self.replay_btn = ttk.Button(bottom, text="再来一轮（还是那块区域，不用重框）",
+                                     command=self._replay_scan)
+        self.rescan_btn = ttk.Button(bottom, text="重新框选（接着收同一份文件）",
+                                     command=self.grab_region)
+        self._rescan_shown = False
         self.log = tk.Text(bottom, height=self._log_lines, wrap="none", font=("Consolas", 9),
                            bg="#fbfbfb", relief="flat", state="disabled")
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def _show_rescan(self, show: bool):
+        """缺帧才露出补录按钮；不占常驻空间，也不会把底部按钮挤掉。"""
+        if show == self._rescan_shown:
+            return
+        self._rescan_shown = show
+        try:
+            if show:
+                if self._last_phys:
+                    self.replay_btn.pack(fill="x", padx=8, pady=(0, 2),
+                                         before=self.log)
+                self.rescan_btn.pack(fill="x", padx=8, pady=(0, 4),
+                                     before=self.log)
+            else:
+                self.replay_btn.pack_forget()
+                self.rescan_btn.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _replay_scan(self):
+        """拿上次那块区域再来一轮 —— 补录几十个帧，不用重新拖框。
+
+        「漏了几帧 → 再框一次」这条路上，最多的摩擦是**重新拖框**：手一抖就
+        框歪，于是又白扫一轮。同一块屏幕、同一段动图，区域根本没变，记住坐标
+        直接重扫就行。
+        """
+        if not self._last_phys:
+            return self.grab_region()
+        try:
+            from PIL import ImageGrab
+        except Exception:  # noqa: BLE001
+            return self.grab_region()
+        bbox = self._last_phys
+        self._show_rescan(False)
+        self._log("· 再来一轮：还是上次那块区域 %d×%d @ (%d,%d)，不用重新框"
+                  % (bbox[2] - bbox[0], bbox[3] - bbox[1], bbox[0], bbox[1]))
+        self.root.withdraw()
+        self.root.update_idletasks()
+        time.sleep(0.05)
+        try:
+            self._run_scan(bbox, ImageGrab)
+        except Exception as exc:  # noqa: BLE001
+            self._restore_window()
+            messagebox.showerror(APP_TITLE, "重扫失败：\n%s" % exc)
 
     # ---------------- 选项区滚动 ----------------
     def _on_opt_canvas_resize(self, event):
@@ -966,6 +1026,9 @@ class App:
         # 遮罩底下还是窗口自己）。框选期间先收起来，识别完再放回来。
         mons = self._monitors()
         vx0, vy0, vw0, vh0 = self._virtual_screen()
+        if self._scan_texts:
+            self._log("· 接着上次：已攒 %d 帧，这次框选会往上续（同一份文件才续得上）"
+                      % len(self._scan_texts))
         self._log("· 准备框选：虚拟桌面 %d×%d @ (%d,%d)，%d 块屏 —— "
                   "主窗口已隐藏，识别完自动恢复"
                   % (vw0, vh0, vx0, vy0, len(mons) or 1))
@@ -973,8 +1036,6 @@ class App:
         self.root.update_idletasks()
 
         top, canvas, vx, vy, vw, vh = self._build_overlay()
-        # 兜底：万一后台线程被卡住（截屏 API 被杀软拦、桌面切换），窗口也得回来
-        self.root.after(int(qr.SCAN_CAP * 1000) + 8000, self._restore_window)
         box = {"x0": 0, "y0": 0, "rect": None, "p0": None}
 
         def clamp_x(x):
@@ -1042,11 +1103,72 @@ class App:
 
     def _restore_window(self):
         """把主窗口放回来（框选期间会隐藏）。重复调用无害。"""
+        self._scan_active = False
+        self._drop_hud()
         try:
             if self.root.state() != "normal":
                 self.root.deiconify()
             self.root.lift()
         except tk.TclError:
+            pass
+
+    # ---------------- 扫描期间的小悬浮条 ----------------
+
+    def _make_hud(self, bbox):
+        """扫描期间在框外角落放一条极小的状态条：进度 + 停止。
+
+        整套扫描可能跑几分钟（978 帧的动图按 3 帧/秒播一轮就是 326 秒），
+        这期间主窗口是藏起来的 —— 没有它就既看不到进度、也没法中止。
+        位置自动躲开框选区域，免得它自己挡住要扫的码；实在躲不开就不显示。
+        """
+        try:
+            vx, vy, vw, vh = self._virtual_screen()
+            w, h = 340, 64
+            spots = [(vx + 16, vy + 16), (vx + vw - w - 16, vy + 16),
+                     (vx + 16, vy + vh - h - 16), (vx + vw - w - 16, vy + vh - h - 16)]
+            place = None
+            for sx, sy in spots:
+                if sx + w <= bbox[0] or sx >= bbox[2] or sy + h <= bbox[1] or sy >= bbox[3]:
+                    place = (sx, sy)
+                    break
+            if place is None:
+                return None
+            hud = tk.Toplevel(self.root)
+            hud.overrideredirect(True)
+            hud.attributes("-topmost", True)
+            hud.geometry("%dx%d+%d+%d" % (w, h, place[0], place[1]))
+            hud.configure(bg="#1f2430")
+            tk.Label(hud, text="正在连拍收帧 · 别切窗口", bg="#1f2430", fg="#9fb3d1",
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=10, pady=(6, 0))
+            row = tk.Frame(hud, bg="#1f2430")
+            row.pack(fill="x", padx=10, pady=(2, 6))
+            self._hud_text = tk.StringVar(value="已收 0 帧")
+            tk.Label(row, textvariable=self._hud_text, bg="#1f2430", fg="#ffffff",
+                     font=("Microsoft YaHei UI", 9)).pack(side="left")
+            tk.Button(row, text="停止", command=self._stop_scan, relief="flat",
+                      bg="#3b4356", fg="#ffffff", activebackground="#4a5468",
+                      font=("Microsoft YaHei UI", 8), padx=8, cursor="hand2"
+                      ).pack(side="right")
+            return hud
+        except tk.TclError:
+            return None
+
+    def _drop_hud(self):
+        hud = getattr(self, "_hud", None)
+        self._hud = None
+        if hud is None:
+            return
+        try:
+            hud.destroy()
+        except tk.TclError:
+            pass
+
+    def _stop_scan(self):
+        """点「停止」：让扫描线程收工，已收到的帧照常保留（下次接着收）。"""
+        self._scan_cancelled = True
+        try:
+            self._hud_text.set("正在停止…")
+        except (tk.TclError, AttributeError):
             pass
 
     def _save_scan_frame(self, img):
@@ -1105,33 +1227,78 @@ class App:
         界面不会假死。
         """
         self._scan_cancelled = False
+        self._scan_active = True
         scale = self._grab_scale(ImageGrab)
         if abs(scale - 1.0) > 0.01:
             self._log("· 屏幕缩放 %.0f%%：框选坐标已按物理像素换算"
                       "（这就是「一块屏能识别、换块屏框不准」的根因）"
                       % (scale * 100))
             bbox = self._scale_bbox(bbox, scale)
+        self._run_scan(bbox, ImageGrab)
+
+    def _scan_fps(self) -> float:
+        """按界面上设的「帧/秒」去估收帧要多久。
+
+        GIF 就是本程序按这个帧率生成的，屏幕上放的时候也是这个速度 —— 拿它
+        算「播一轮要多久」才对得上。改成别的值也不会出事：扫描过程中还会拿
+        实测收帧速度再校准一次。
+        """
+        try:
+            return max(0.5, min(20.0, float(self.qr_fps.get())))
+        except (ValueError, tk.TclError, AttributeError):
+            return 3.0
+
+    def _run_scan(self, bbox, ImageGrab):
+        """真正开始连拍（``bbox`` 已经是物理像素坐标）。"""
+        self._scan_cancelled = False
+        self._scan_active = True
         self._scan_bbox = bbox
+        self._last_phys = tuple(int(v) for v in bbox)
+        self._hud = self._make_hud(bbox)
+        # 兜底：万一后台线程被卡住（截屏 API 被杀软拦、桌面切换），窗口也得回来。
+        # 用「绝对天花板」而不是默认 30 秒 —— 978 帧的动图本来就要跑好几分钟。
+        self.root.after(int(qr.SCAN_CAP_MAX * 1000) + 15000, self._restore_window)
+        fps = self._scan_fps()
         self._log("· 正在扫描框选区域 %d×%d @ (%d,%d) —— 动图请让它继续在框里循环播放"
                   "（首帧开始、尾帧收工，收齐自动停）"
                   % (bbox[2] - bbox[0], bbox[3] - bbox[1], bbox[0], bbox[1]))
+        self._log("· 按 %.0f 帧/秒估算：收到第一帧读出总帧数后，连拍上限会放到"
+                  "「够播 2.5 轮」，收齐前不会自己停；角落小条上有预计剩余时间"
+                  % fps)
+        # 只抓框内那块的 GDI 抓图：比 ImageGrab 整屏再裁快 4 倍（83ms → 20ms）。
+        # 采样快了才追得上 3 帧/秒的播放速度，不然一帧丢一帧。
         last = {"t": 0.0}
-
-        def grab():
-            return ImageGrab.grab(bbox=bbox, all_screens=True)
+        grab_fast = _make_grabber(bbox)
+        if grab_fast is None:
+            def grab():
+                return ImageGrab.grab(bbox=bbox, all_screens=True)
+        else:
+            def grab():
+                try:
+                    return grab_fast()
+                except Exception:  # noqa: BLE001  个别显卡/远控环境下 BitBlt 会失败
+                    return ImageGrab.grab(bbox=bbox, all_screens=True)
 
         def report(st):
-            # 日志别刷屏：约每 0.5 秒一行，且只在真有新帧时才说
-            if st["frames"] and st["elapsed"] - last["t"] >= 0.5:
+            # 日志别刷屏：3 秒一行，且只在真有新帧时才说。978 帧的动图要跑几分钟，
+            # 原来 0.5 秒一行能刷出六十多行，把有用信息全冲没了。
+            if st["frames"] and st["elapsed"] - last["t"] >= 3.0:
                 last["t"] = st["elapsed"]
-                self.queue.put(("log", "  已抓 %d 枪，收到 %d 帧…"
-                                % (st["shots"], st["frames"])))
+                need = st.get("need")
+                text = ("已收 %d/%d 帧" % (st["frames"], need)) if need \
+                    else ("已收 %d 帧" % st["frames"])
+                eta = st.get("eta")
+                tail = _fmt_eta(eta)          # 「还要 1 分 40 秒」/「快好了」
+                self.queue.put(("hud", "%s · %s" % (text, tail)))
+                self.queue.put(("log", "  %s（%d 枪 · 已用 %.0f 秒 · %s）"
+                                % (text, st["shots"], st["elapsed"], tail)))
 
         def worker():
             try:
                 texts, stats = qr.scan_region(
                     grab, on_progress=report,
-                    should_stop=lambda: self._scan_cancelled)
+                    should_stop=lambda: self._scan_cancelled,
+                    frames_per_sec=fps)
             except Exception as exc:  # noqa: BLE001
                 self.queue.put(("call", lambda e=exc: self._scan_failed(e)))
                 return
@@ -1187,6 +1354,7 @@ class App:
         self._restore_window()
         self.root.configure(cursor="")
         if not texts:
+            self._show_rescan(bool(self._scan_texts))
             shot = self._save_scan_frame(stats.get("image"))
             self._log("✗ 框选区域没识别到二维码：%.1f 秒 / %d 枪"
                       % (stats["elapsed"], stats["shots"]))
@@ -1230,7 +1398,8 @@ class App:
 
         missing = self._missing_frames(self._scan_texts)
         if missing:
-            self._log("· %s —— 让动图继续循环，再框一次会自动续上" % missing)
+            self._show_rescan(True)
+            self._log("· %s —— 点「再来一轮」还是这块区域接着收，不必重框" % missing)
             # 帧数很多却只收到一两帧、又始终没见到首尾标识帧：框到的是**静态图**
             # （照片/截图/网页里的一张码）。静态图永远只有 1 帧，再怎么框也补不齐，
             # 得让用户换路子，而不是让他反复框同一张图。
@@ -1247,11 +1416,13 @@ class App:
             messagebox.showwarning(
                 APP_TITLE,
                 "还差几帧，已收的都替你先攒着了。\n\n%s\n\n"
-                "让动图继续循环播放，再框一次同一块区域即可自动补上（不必从头来）。"
+                "让动图继续循环播放，点「再来一轮（还是那块区域）」即可自动补上 —— "
+                "不用重新拖框（只有框歪了才需要「重新框选」）。"
                 % missing)
             return
 
         texts, self._scan_texts = list(self._scan_texts), []
+        self._show_rescan(False)
         try:
             results = self._unpack_frames(texts, "屏幕框选")
         except Exception as exc:  # noqa: BLE001
@@ -1290,9 +1461,9 @@ class App:
         for doc_id, total in need.items():
             missing = [i for i in range(1, total + 1) if i not in got.get(doc_id, set())]
             if missing:
-                notes.append("共 %d 帧，已收 %d，缺第 %s 帧"
-                             % (total, total - len(missing),
-                                "、".join(str(i) for i in missing)))
+                notes.append("共 %d 帧，已收 %d，缺 %d 帧：第 %s 帧"
+                             % (total, total - len(missing), len(missing),
+                                _frame_ranges(missing)))
         return "；".join(notes)
 
     def _unpack_qr_image(self, images, source: str):
@@ -1596,6 +1767,10 @@ class App:
         self._bar_logged = -1
         self._bar_last = (0, 1, "")
         try:
+            if getattr(self, "_bar_writing", False):
+                self.sub_progress.stop()
+                self.sub_progress.configure(mode="determinate")
+                self._bar_writing = False
             self.sub_progress.configure(maximum=1, value=0)
             self.prog_text.configure(text="")
         except tk.TclError:
@@ -1607,9 +1782,25 @@ class App:
         done = max(0, min(int(done), total))
         self._bar_last = (done, total, phase)
         self._bar_tick = time.monotonic()
+        # 「写入」是 PIL 内部一次性压完所有帧，没法按帧报进度 ——
+        # 进度条切成来回滚动的动画，让人看出还在动，而不是停在 100% 假死。
+        writing = "写入" in (phase or "")
         try:
-            self.sub_progress.configure(maximum=total, value=done)
+            if writing and not getattr(self, "_bar_writing", False):
+                self.sub_progress.configure(mode="indeterminate")
+                self.sub_progress.start(120)
+                self._bar_writing = True
+            elif not writing and getattr(self, "_bar_writing", False):
+                self.sub_progress.stop()
+                self.sub_progress.configure(mode="determinate")
+                self._bar_writing = False
+            if not writing:
+                self.sub_progress.configure(maximum=total, value=done)
         except tk.TclError:
+            return
+        if writing:
+            self.prog_text.configure(
+                text="%s · 大文件要几十秒，别关窗口" % phase)
             return
         pct = int(done * 100 / total)
         text = "%s %d%% (%d/%d)" % (phase or "处理", pct, done, total)
@@ -1624,6 +1815,14 @@ class App:
 
     def _bar_heartbeat(self):
         """一秒一跳的心跳：长任务里进度不动时，至少让人看出还在跑。"""
+        if self._scan_active:
+            # 框选扫描期间主窗口必须是藏起来的：它一露头就压在要扫的码上，
+            # 每枪抓到的画面里都会多出一块窗口 —— 用户从任务栏把它点回来也一样。
+            try:
+                if self.root.state() != "withdrawn":
+                    self.root.withdraw()
+            except tk.TclError:
+                pass
         if not self._bar_t0 or not (self.worker and self.worker.is_alive()):
             return
         now = time.monotonic()
@@ -1642,6 +1841,7 @@ class App:
     def start(self):
         if self.worker and self.worker.is_alive():
             return
+        self._show_rescan(False)
         if not self.files:
             messagebox.showinfo(APP_TITLE, "请先添加文件")
             return
@@ -1753,7 +1953,10 @@ class App:
         ``phase`` 给了就锁死阶段名（比如「合成动图」），没给就用 qr 自己报的。
         """
         def report(done, total, step=""):
-            self.queue.put(("bar", (done, total, phase or step or "处理")))
+            name = phase or "处理"
+            if step and step != "渲染":
+                name = "%s·%s" % (name, step)      # 合成动图·写入 WebP
+            self.queue.put(("bar", (done, total, name)))
         return report
 
     def _pack_one_qr(self, src, name, out_dir, password, cipher, compress_mode,
@@ -1774,6 +1977,11 @@ class App:
         want_single = "仅总览" not in qr_format
         want_gif = "GIF" in qr_format and len(frames) > 1
         want_webp = "WebP" in qr_format and len(frames) > 1
+        if not (want_png or want_gif or want_webp):
+            # 只选了动图格式，但这份文件一帧就装下了 —— 没有「动」可言。
+            # 不能就这么啥也不写，老老实实出一张单帧 PNG。
+            want_png = True
+            want_single = True
         self.queue.put(("log", "   拆成 %d 张码，开始出图（%s）…"
                         % (len(frames), "渲染 PNG" if want_png else "合成动图")))
 
@@ -1899,6 +2107,11 @@ class App:
                     bars = payload      # 积压时只认最后一条，免得主线程被刷爆
                 elif kind == "done":
                     self._finish(payload)
+                elif kind == "hud":
+                    try:
+                        self._hud_text.set(payload)
+                    except (tk.TclError, AttributeError):
+                        pass
                 elif kind == "call":
                     payload()          # 工作线程派回主线程的回调（弹窗必须在主线程）
         except queue.Empty:
@@ -1938,6 +2151,116 @@ def _cursor_pos():
     except Exception:  # noqa: BLE001  非 Windows / 调用失败就走回退路径
         pass
     return None
+
+
+def _fmt_eta(eta) -> str:
+    """把「还要多少秒」说成人话：「还要 1 分 40 秒」/「就快好了」。
+
+    ETA 是件很重要的事：978 帧要连拍好几分钟，光看帧数一点点涨，谁都会觉得
+    「这得等到什么时候」。给出预计剩余时间，才知道是可以去泡杯茶，还是马上
+    就完事了。
+    """
+    if eta is None:
+        return "正在估时"
+    if eta <= 3:
+        return "就快好了"
+    if eta < 60:
+        return "还要 %d 秒" % int(round(eta))
+    minutes, seconds = divmod(int(round(eta)), 60)
+    if minutes < 10:
+        return "还要 %d 分 %02d 秒" % (minutes, seconds)
+    return "还要约 %d 分钟" % minutes
+
+
+def _frame_ranges(nums: list[int], max_parts: int = 8) -> str:
+    """把帧号压成区间：「1–118、209–547、……」。
+
+    978 帧缺 700 个时，逐个列出来是一千多个字符的流水账，日志直接没法看；
+    压成区间后既知道缺多少，也一眼看出缺的是哪几段连续的。
+    """
+    if not nums:
+        return ""
+    spans: list[tuple[int, int]] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        spans.append((start, prev))
+        start = prev = n
+    spans.append((start, prev))
+    parts = [("%d" % a) if a == b else ("%d–%d" % (a, b)) for a, b in spans]
+    if len(parts) > max_parts:
+        return "、".join(parts[:max_parts]) + "…等 %d 段" % len(parts)
+    return "、".join(parts)
+
+
+def _make_grabber(bbox):
+    """做一个「只抓框内区域」的抓图函数（Windows GDI BitBlt）；失败返回 None。
+
+    为什么不用 ``ImageGrab``：它在 Windows 上**每次都把整个虚拟桌面抓下来再裁**，
+    双屏 3840×1200 就是 18MB 的拷贝。实测抓同一块 971×948：
+
+    * ``ImageGrab.grab(bbox=…, all_screens=True)``：**83ms/枪**
+    * GDI ``BitBlt`` 只抓框内那块：**20ms/枪**（4 倍）
+
+    动图 3 帧/秒、每帧停留 333ms，一枪 83ms 时采样点会漂，实测 142 枪只收到
+    90 帧（漏 37%）；降到 20ms 后每帧能采 4~5 次，基本不丢。
+
+    GDI 用的是**物理像素坐标**（和 ``ImageGrab`` 一致，已实测逐像素相同），
+    所以传进来的 bbox 必须是换算过 scale 的物理坐标。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from PIL import Image
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        width, height = x2 - x1, y2 - y1
+        if width <= 0 or height <= 0:
+            return None
+
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        hdc_screen = user32.GetDC(0)
+        if not hdc_screen:
+            return None
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
+        gdi32.SelectObject(hdc_mem, hbmp)
+
+        class _BitmapInfoHeader(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long),
+                        ("biHeight", ctypes.c_long), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD),
+                        ("biXPelsPerMeter", ctypes.c_long),
+                        ("biYPelsPerMeter", ctypes.c_long),
+                        ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+
+        info = _BitmapInfoHeader()
+        info.biSize = ctypes.sizeof(_BitmapInfoHeader)
+        info.biWidth, info.biHeight = width, -height      # 负高度 = 自上而下
+        info.biPlanes, info.biBitCount = 1, 32
+        info.biCompression = 0
+        buf = ctypes.create_string_buffer(width * height * 4)
+        src_copy = 0x00CC0020                              # SRCCOPY
+
+        def grab():
+            if not gdi32.BitBlt(hdc_mem, 0, 0, width, height,
+                                hdc_screen, x1, y1, src_copy):
+                raise OSError("BitBlt 失败")
+            if not gdi32.GetDIBits(hdc_mem, hbmp, 0, height, buf,
+                                   ctypes.byref(info), 0):
+                raise OSError("GetDIBits 失败")
+            # copy() 必须留：buf 会被下一枪覆写，不拷出来所有帧会变成同一张
+            return Image.frombuffer("RGB", (width, height), buf,
+                                    "raw", "BGRX", 0, 1).copy()
+
+        return grab
+    except Exception:  # noqa: BLE001  非 Windows / API 不可用就走 ImageGrab
+        return None
 
 
 def _enable_dpi_awareness() -> None:

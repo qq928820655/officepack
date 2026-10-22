@@ -10,7 +10,10 @@ import os
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DIST = os.path.join(ROOT, "dist")
+#: 产物目录。留空就用 ``dist``；用环境变量可以指到别处 —— Windows 上
+#: 正在运行的那个 exe 会锁住它所在的目录（连改名都不行），换目录构建
+#: 就不用去动用户手上正开着的那一份。
+DIST = os.environ.get("OFFICEPACK_DIST") or os.path.join(ROOT, "dist")
 
 TARGETS = [
     ("OfficePack-GUI", "OfficePack-GUI-win64.zip", True),

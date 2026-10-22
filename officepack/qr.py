@@ -462,6 +462,9 @@ def render_gif(
     # 但 L 模式的中间图可以用完就丢，峰值内存只多一份 P 图。
     images = [_bilevel(im)
               for im in _anim_source(frames, ec, target_px, markers, progress)]
+    # 出图完了还有一步「把 N 帧压成一张动图」，几百帧能跑几十秒。
+    # 不报这一步，进度条会停在 100% 一动不动，看起来就像卡死。
+    _tick(progress, len(images), len(images), "写入 GIF")
     images[0].save(
         out_path, "GIF", save_all=True, append_images=images[1:],
         duration=duration, loop=0, optimize=True, disposal=2,
@@ -512,6 +515,7 @@ def render_webp(
     duration = _anim_duration(fps)
     # 无损 WebP 直接吃 L 模式原图：它内部自己会做二值友好的预测，不需要调色板
     images = list(_anim_source(frames, ec, target_px, markers, progress))
+    _tick(progress, len(images), len(images), "写入 WebP")
     images[0].save(
         out_path, "WEBP", save_all=True, append_images=images[1:],
         duration=duration, loop=0, lossless=True, quality=100, method=method,
@@ -949,6 +953,10 @@ def _looks_complete(texts: list[str]) -> bool:
 SCAN_INTERVAL = 0.05
 SCAN_IDLE = 3.0
 SCAN_CAP = 30.0
+#: 屏幕上有标识帧（也就是我们自己的动图）时，「多久没有新帧」的判死时间要长得多：
+#: 播放器可能暂停、缓冲、被别的窗口挡住一会儿。3 秒就判死，用户回来一看白框了。
+#: 真正判断「收完了」靠的是「连续两整轮颗粒无收」，这条只是兜住播放停住的情况。
+SCAN_STALL = 20.0
 #: 连开几枪一张码都没见着就提前收工。别定太小：整屏抓图 + 解码一枪约
 #: 0.2 秒（多屏时 ``all_screens=True`` 要先把整个虚拟桌面抓下来再裁），
 #: 6 枪只有 1.3 秒 —— 屏幕刚好在这一瞬刷新/滚动就白判了。10 枪约 2 秒，
@@ -956,6 +964,13 @@ SCAN_CAP = 30.0
 SCAN_EMPTY_SHOTS = 10
 #: 连拍结束后对最后一张图做全力重试的预算
 SCAN_DEEP_BUDGET = 4.0
+#: 单次扫描的绝对天花板。正常收一份文件是「播完一整轮」那么久（978 帧 3 帧/秒
+#: 就是 326 秒），这里兜住极端情况：屏幕上放的是永远收不齐的东西（别人的动态码、
+#: 播放器卡在同一帧、无限滚动），别让它对着屏幕空转半小时。
+SCAN_CAP_MAX = 1800.0
+#: 帧数太少时实测速率不准（前几帧往往挤在一个刷新里到齐），先攒够这么多帧
+#: 再拿实测速度推算「还要多久」。
+SCAN_RATE_MIN = 8
 
 
 def _frame_key(img) -> bytes | None:
@@ -968,9 +983,52 @@ def _frame_key(img) -> bytes | None:
         return None
 
 
+def _adaptive_cap(cap: float, need: int | None, fps: float,
+                  got: int = 0, span: float = 0.0) -> float:
+    """按总帧数放宽连拍上限。
+
+    978 帧的动图按 3 帧/秒播一轮要 **326 秒**，而默认上限只有 30 秒 ——
+    卡在这里永远只能收到一小半，用户得反复框十几次，每次还都随机漏。
+    收到第一帧读出总帧数后，把上限放开到「够播一整轮」。
+
+    光按标称帧率算还不够：屏幕上那段动图是**播放器**在放，它可能按 2 帧/秒
+    慢慢放、也可能被拖慢（解码跟不上、远程桌面掉帧）。所以再拿**实测收帧
+    速度**推一遍「收齐还剩多久」，取两者里大的那个 —— 播放比预期慢时自动
+    续命，不会刚收到一半就超时收工。
+    """
+    if not need:
+        return cap
+    # 一轮播完必然收齐；留到 2.5 轮是为了「个别帧这一轮恰好没解出来」时还有
+    # 下一轮的机会 —— 真收完了会靠「连续两轮没有新帧」提前退出，不会真跑满。
+    guess = need / max(0.5, float(fps)) * 2.5 + 15.0
+    if got >= SCAN_RATE_MIN and span > 0:
+        eta = need / max(0.2, got / span) * 1.15 + 15.0
+        guess = max(guess, min(eta, need * 2.5))   # 最慢按 0.4 帧/秒兜底
+    return min(SCAN_CAP_MAX, max(cap, guess))
+
+
+def _eta(need: int | None, got: int, span: float) -> float | None:
+    """还要多久收齐（秒）。按实测收帧速度推；样本太少就返回 None。"""
+    if not need or got < SCAN_RATE_MIN or span <= 0 or got >= need:
+        return None
+    return max(0.0, (need - got) / max(0.2, got / span))
+
+
+def _total_frames(texts: Sequence[str]) -> int | None:
+    """从已收的帧里读出「这份文件一共多少帧」（段头里写着）。"""
+    try:
+        segs = ct.parse_segments("\n".join(texts))
+    except Exception:  # noqa: BLE001
+        return None
+    if not segs:
+        return None
+    return max(seg.total for seg in segs)
+
+
 def scan_region(grab, idle: float | None = None, cap: float | None = None,
                 interval: float | None = None, on_progress=None,
-                should_stop=None) -> tuple[list[str], dict]:
+                should_stop=None, frames_per_sec: float = 3.0
+                ) -> tuple[list[str], dict]:
     """对着同一块屏幕区域连续抓图，把动图里一帧帧的码全收下来。
 
     框选的真正用途就是动图：**一张截图只能拿到播放中的某一帧**，而一段动态
@@ -983,16 +1041,32 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
       一帧新东西都没收到才放弃。
     * **没有标识**（旧动图 / 别人的图）：连续 ``idle`` 秒没有新帧就收工。
 
+    **一直收到齐为止**：``cap`` 默认 30 秒，但 978 帧的动图按 3 帧/秒播一轮
+    就要 326 秒 —— 卡 30 秒永远只能收到一小半，用户得反复框十几次才凑得齐
+    （实测有人框了 35 次）。所以收到第一帧、从段头读出总帧数之后，把上限放宽到
+    「够播 2.5 轮」，并拿实测收帧速度续命。停止条件变成：
+
+    * 收齐了 → 立刻停；
+    * 用户点了「停止」→ 停；
+    * 连续两整轮一帧新的都没收到（屏幕上确实没得收了）→ 停；
+    * ``SCAN_STALL`` 秒一帧新的都没有（播放暂停/被挡住）→ 停。
+
+    小文件不受影响（``max`` 取大的那个，30 秒照旧够）。
+
     ``grab()`` 由调用方提供（返回 PIL.Image），本模块不碰屏幕，便于测试。
 
     返回 ``(texts, stats)``，texts 不含标识帧；stats 含
-    ``shots / frames / cycles / complete / elapsed``。
+    ``shots / frames / cycles / complete / elapsed / need``。
     """
     import time
 
     idle = SCAN_IDLE if idle is None else idle
     cap = SCAN_CAP if cap is None else cap
     interval = SCAN_INTERVAL if interval is None else interval
+    if frames_per_sec >= 6.0:
+        # 帧率高的时候别再加人为间隔：GDI 抓图 17ms + 指纹 7ms + 解码 37ms，
+        # 不加间隔也有 16 枪/秒 —— 10 帧/秒的动图采得到 1.6 倍，够用。
+        interval = 0.0
 
     started = time.monotonic()
     last_new = started
@@ -1006,6 +1080,8 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
     progress_cycle = 0    # 最近一次收到新帧时的轮次
     saw_end = False
     marked = False
+    need = None           # 文档总帧数（收到第一帧后从段头读出来）
+    first_new = None      # 第一帧到手的时间，用来量「实测收帧速度」
 
     while True:
         now = time.monotonic()
@@ -1015,8 +1091,8 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
             # 有标识帧：按轮次算，连续两轮颗粒无收才放弃（期间画面继续播）
             if saw_end and starts - progress_cycle >= 2:
                 break
-            # 尾帧一直没被认出来（播放卡住/码太糊），别死等到 cap
-            if not saw_end and (now - last_new) >= idle * 2:
+            # 尾帧一直没被认出来、或者播放器暂停/缓冲/被切走：给足时间再判死
+            if (now - last_new) >= max(idle * 2, SCAN_STALL):
                 break
         elif (now - last_new) >= idle:
             break
@@ -1064,16 +1140,28 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
                     seen.update(fresh)
                     texts.extend(fresh)
                     last_new = time.monotonic()
+                    if first_new is None:
+                        first_new = last_new
                     if starts:
                         progress_cycle = starts
+                    if need is None:
+                        # 收到第一帧就知道这份文件一共多少帧了 —— 978 帧按 3 帧/秒
+                        # 播一轮要 326 秒，卡 30 秒上限永远只能收一小半。
+                        need = _total_frames(texts)
+                    # 边收边续命：播放比预期慢就自动把上限往后放
+                    cap = _adaptive_cap(cap, need, frames_per_sec,
+                                        len(texts), last_new - first_new)
                 if texts and _looks_complete(texts):
                     complete = True
                     break
         if on_progress is not None:
+            span = (time.monotonic() - first_new) if first_new else 0.0
             try:
                 on_progress({"shots": shots, "frames": len(texts), "cycles": starts,
                              "elapsed": time.monotonic() - started,
-                             "complete": complete})
+                             "complete": complete, "need": need,
+                             # 「还要多久收齐」——不然只能看着帧数一点点涨干等
+                             "eta": _eta(need, len(texts), span)})
             except Exception:  # noqa: BLE001  回调出错不能拖垮识别
                 pass
         time.sleep(interval)
@@ -1092,6 +1180,7 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
 
     return texts, {"shots": shots, "frames": len(texts), "cycles": starts,
                    "complete": complete, "elapsed": time.monotonic() - started,
+                   "need": need, "cap": cap,
                    # 最后一枪的画面：一无所获时调用方可以存下来，让「识别不了」
                    # 有据可查 —— 光靠嘴说定位不了是码太糊、框错地方还是被窗口挡了。
                    "image": last_img}

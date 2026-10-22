@@ -221,6 +221,88 @@ class GarbageTextTest(unittest.TestCase):
             ct.unpack_texts(["B40B"], out_dir=os.path.join(self.tmp, "p"))
 
 
+class ScanBudgetTest(unittest.TestCase):
+    """978 帧的动图：30 秒上限根本不够播一轮。"""
+
+    def test_cap_grows_to_cover_one_loop(self):
+        """收到第一帧读出总帧数后，上限要放宽到「够播好几轮」。"""
+        self.assertEqual(qr._adaptive_cap(30.0, None, 3.0), 30.0)
+        cap = qr._adaptive_cap(30.0, 978, 3.0)
+        self.assertGreater(cap, 978 / 3.0, "上限比一轮播放还短，永远收不全")
+        self.assertAlmostEqual(cap, 978 / 3.0 * 2.5 + 15.0, places=1)
+
+    def test_cap_follows_measured_playback_rate(self):
+        """播放器比标称帧率慢时，要按实测速度续命。
+
+        标称 3 帧/秒算出一轮 326 秒，可屏幕上实际只有 1.5 帧/秒（一轮 652
+        秒）—— 只按标称算就会在播到一半时超时收工，用户又得再框一次。
+        """
+        got, span = 60, 40.0                # 实测 1.5 帧/秒
+        cap = qr._adaptive_cap(30.0, 978, 3.0, got, span)
+        self.assertGreater(cap, 978 / 1.5 * 0.9, "实测更慢却没续命")
+        # 样本太少时不能信实测速度（前几帧往往挤在一个刷新里到齐）
+        self.assertAlmostEqual(qr._adaptive_cap(30.0, 978, 3.0, 3, 0.2),
+                               978 / 3.0 * 2.5 + 15.0, places=1)
+
+    def test_cap_never_runs_forever(self):
+        """屏幕上放的是永远收不齐的东西时，也不能空转半小时。"""
+        cap = qr._adaptive_cap(30.0, 20000, 1.0, 10, 60.0)
+        self.assertLessEqual(cap, qr.SCAN_CAP_MAX)
+
+    def test_eta_counts_down(self):
+        """界面上要说「还要多久」，不能只让帧数一点点涨。"""
+        self.assertIsNone(qr._eta(None, 100, 40.0), "不知道总数就别瞎猜")
+        self.assertIsNone(qr._eta(978, 3, 1.0), "样本太少，估不准")
+        self.assertIsNone(qr._eta(978, 978, 200.0), "已经收齐了还估什么")
+        eta = qr._eta(978, 100, 50.0)       # 2 帧/秒，还差 878 帧
+        self.assertAlmostEqual(eta, 878 / 2.0, places=0)
+
+    def test_one_pass_reaches_every_frame(self):
+        """一轮框选就该收全：上限会自动放宽，一直轮询到收齐才停。
+
+        以前上限 30 秒，978 帧的动图每轮只能收 90 帧，用户框了 35 次才凑齐
+        ——「感觉在碰运气」。这里模拟屏幕上一段循环播放的动图：每次抓图给出
+        下一帧，断言一次 scan_region 就能把每一帧都收到。
+        """
+        import random as _r
+
+        raw = _r.Random(7).randbytes(12000)
+        pack = ct.pack_bytes(raw, "n.bin", codec_name="qr45", compress="none",
+                             cipher_name="none", preview=False)
+        frames = qr.build_frames(pack, "L")
+        # 屏幕上放的是 render_gif 生成的动图：首标识帧 + 数据帧 + 尾标识帧
+        marks = qr._mark_texts(frames)
+        imgs = qr._render_uniform([marks[0]] + list(frames) + [marks[1]], "L", 260)
+
+        state = {"i": 0}
+
+        def grab():
+            img = imgs[state["i"] % len(imgs)]
+            state["i"] += 1
+            return img
+
+        texts, stats = qr.scan_region(grab, cap=1.0, interval=0.0,
+                                      frames_per_sec=30.0)
+        self.assertTrue(stats["complete"], "一轮框选没收到齐")
+        self.assertEqual(len(texts), len(frames), "漏帧了")
+        self.assertEqual(stats["need"], len(frames))
+        self.assertGreater(stats["cap"], 1.0, "上限没有按总帧数放宽")
+
+
+        """扫到的帧里带着总帧数，界面上要能显示「已收 90/978」。"""
+        import random as _r
+
+        raw = _r.Random(3).randbytes(6000)
+        pack = ct.pack_bytes(raw, "n.bin", codec_name="qr45", compress="none",
+                             cipher_name="none", preview=False)
+        frames = qr.build_frames(pack, "L")
+        texts, stats = qr.scan_region(lambda: None, idle=0.2, interval=0.0,
+                                      cap=1.0)
+        self.assertIsNone(stats.get("need"), "一张没收到时不该瞎报总数")
+        # 真实扫描路径里 need 来自段头，这里直接验解析
+        self.assertEqual(qr._total_frames(list(frames)), len(frames))
+
+
 class WebpAnimationTest(unittest.TestCase):
     """动图 WebP：逐像素无损、体积约为 GIF 的 1/5，且能直接当输入还原。"""
 
@@ -257,6 +339,18 @@ class WebpAnimationTest(unittest.TestCase):
         qr.render_webp(self.frames, webp, "L", fps=3, target_px=400)
         self.assertLess(os.path.getsize(webp) * 2, os.path.getsize(gif),
                         "WebP 没比 GIF 小一半，压缩没生效")
+
+    def test_gif_reports_write_phase(self):
+        """出图完还有「写入动图」那一步，几百帧能跑几十秒，必须报出来。
+
+        不报的话进度条停在 100% 一动不动，看起来就像卡死 —— 用户实测
+        「合成 WebP 100% 之后还要干等接近 30 秒」。
+        """
+        seen = []
+        path = os.path.join(self.tmp, "p.gif")
+        qr.render_gif(self.frames, path, "L", fps=3, target_px=200,
+                      progress=lambda d, t, p: seen.append(p))
+        self.assertTrue(any("写入" in p for p in seen), "没报写入阶段")
 
     def test_webp_can_be_decoded_and_unpacked(self):
         """动图 WebP 也是合法输入：识别、还原要和 GIF 一样走通。"""

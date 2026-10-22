@@ -16,6 +16,7 @@ try:
     import tkinter as tk
 
     from officepack import gui as gui_mod
+    from officepack import qr
 
     _HAS_TK = True
 except Exception:  # pragma: no cover - 无 tkinter 的环境跳过
@@ -235,6 +236,47 @@ class LayoutTest(unittest.TestCase):
             self.assertIn(text, buttons, "面板缺按钮：%s" % text)
         panel.destroy()
         self.root.update()
+
+    # ---- 跨屏框选：逻辑坐标 vs 物理像素 -------------------------------------
+
+    def test_grab_scale_detects_dpi_scaling(self):
+        """整屏抓图比逻辑桌面宽 = 有 DPI 缩放，必须能算出来。
+
+        本机实测过的真 bug：物理桌面 3840×1200，但 Tk / GetSystemMetrics 只说
+        3072×960（125%）—— 框在副屏时按逻辑坐标去抓，抓到的是主屏右半边的空白，
+        于是「同一块屏能识别、换块屏就框不准」。
+        """
+        from PIL import Image
+
+        vw = self.app._virtual_screen()[2]
+
+        class FakeGrab:
+            def __init__(self, width):
+                self.width_ = width
+
+            def grab(self, bbox=None, all_screens=False):
+                return Image.new("RGB", (self.width_, 1200))
+
+        self.assertAlmostEqual(self.app._grab_scale(FakeGrab(vw)), 1.0, places=2)
+        self.assertAlmostEqual(self.app._grab_scale(FakeGrab(int(vw * 1.25))), 1.25,
+                               places=2)
+
+    def test_bbox_is_scaled_to_physical_pixels(self):
+        """副屏上的框（逻辑 1536 起）换算后必须落到主屏物理宽度之后。"""
+        box = (1536, 100, 2300, 840)
+        phys = self.app._scale_bbox(box, 1.25)
+        self.assertEqual(phys, (1920, 125, 2875, 1050))
+        self.assertGreater(phys[0], 1536, "换算后仍在主屏范围，等于没换算")
+        self.assertEqual(self.app._scale_bbox(box, 1.0), box,
+                         "scale=1 时不该动坐标")
+
+    def test_scan_keeps_last_frame_for_diagnosis(self):
+        """扫描没认出东西时要留下最后一张画面，否则「识别不了」无从定位。"""
+        from PIL import Image
+
+        texts, stats = qr.scan_region(lambda: Image.new("RGB", (64, 64), "white"))
+        self.assertEqual(texts, [])
+        self.assertIsNotNone(stats.get("image"), "没留下最后一帧，没法诊断")
 
 
 if __name__ == "__main__":

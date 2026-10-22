@@ -136,6 +136,9 @@ HELP: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
                         "二维码只有黑白两色，GIF 对它是**完全无损**的，数据不会掉；\n"
                         "帧率别贪高：相机对焦+解码要 150ms 以上，2~4 帧/秒最稳。"),
             ("PNG + GIF", "两种都出。先拿总览图在电脑上还原；手机端用动图。" ),
+            ("GIF + WebP", "两种动图都出。WebP 是**无损**的，体积约为 GIF 的 1/5。\n"
+                          "代价：能播动图 WebP 的软件比 GIF 少（Windows「照片」、\n"
+                          "微信可能只显示第一帧）。先确认你的播放器能循环播放它再选这项。" ),
             ("帧/秒", "动图播放速度。太快手机跟不上会更漏帧，太慢要等太久；3 最好用。"),
             ("back", "还原：点「还原二维码 → 框选屏幕区域」，拖框圈住码，松开就连拍识别；\n"
                      "动图请让它一直在框里循环播放 —— 同一块区域会连拍到你收齐为止，\n"
@@ -329,7 +332,8 @@ class App:
         self.qr_fmt_box = ttk.Combobox(qr_row, textvariable=self.qr_format, width=17,
                                        state="readonly",
                                        values=["PNG（单帧 + 总览）", "PNG（仅总览）",
-                                               "GIF 动图", "PNG + GIF"])
+                                               "GIF 动图", "GIF + WebP",
+                                               "PNG + GIF", "PNG + GIF + WebP"])
         self.qr_fmt_box.pack(side="left", padx=(8, 0))
         ttk.Entry(qr_row, textvariable=self.qr_fps, width=3).pack(side="left", padx=(6, 0))
         ttk.Label(qr_row, text="帧/秒", style="Hint.TLabel").pack(side="left", padx=(3, 0))
@@ -958,8 +962,20 @@ class App:
             messagebox.showerror(APP_TITLE, "缺少 Pillow，无法截图：%s" % exc)
             return
 
+        # 主窗口往往铺得很宽，留在屏幕上会正好压住要圈的码（用户实测：窗口太大，
+        # 遮罩底下还是窗口自己）。框选期间先收起来，识别完再放回来。
+        mons = self._monitors()
+        vx0, vy0, vw0, vh0 = self._virtual_screen()
+        self._log("· 准备框选：虚拟桌面 %d×%d @ (%d,%d)，%d 块屏 —— "
+                  "主窗口已隐藏，识别完自动恢复"
+                  % (vw0, vh0, vx0, vy0, len(mons) or 1))
+        self.root.withdraw()
+        self.root.update_idletasks()
+
         top, canvas, vx, vy, vw, vh = self._build_overlay()
-        box = {"x0": 0, "y0": 0, "rect": None}
+        # 兜底：万一后台线程被卡住（截屏 API 被杀软拦、桌面切换），窗口也得回来
+        self.root.after(int(qr.SCAN_CAP * 1000) + 8000, self._restore_window)
+        box = {"x0": 0, "y0": 0, "rect": None, "p0": None}
 
         def clamp_x(x):
             return max(0, min(int(x), vw))
@@ -969,6 +985,7 @@ class App:
 
         def on_press(e):
             box["x0"], box["y0"] = clamp_x(e.x), clamp_y(e.y)
+            box["p0"] = _cursor_pos()          # 按下点的物理坐标（截图用这套）
             box["rect"] = canvas.create_rectangle(box["x0"], box["y0"], box["x0"],
                                                   box["y0"], outline="#ff3b30", width=2)
 
@@ -982,30 +999,103 @@ class App:
                 return
             x1, x2 = sorted((box["x0"], clamp_x(e.x)))
             y1, y2 = sorted((box["y0"], clamp_y(e.y)))
+            p0, p1 = box.get("p0"), _cursor_pos()
             box["rect"] = None
             top.destroy()
             if x2 - x1 < 24 or y2 - y1 < 24:      # 误点一下，当取消
+                self._restore_window()
                 return
             self.root.configure(cursor="watch")
             self.root.update()
+            # 截图区域优先用**物理鼠标坐标**（跨屏不会错位）；拿不到才退回
+            # 「遮罩原点 + 框内偏移」这套 Tk 坐标换算。
+            if p0 and p1:
+                bx1, bx2 = sorted((p0[0], p1[0]))
+                by1, by2 = sorted((p0[1], p1[1]))
+                if bx2 - bx1 < 24 or by2 - by1 < 24:      # 物理坐标异常，用 Tk 的
+                    bx1, by1, bx2, by2 = vx + x1, vy + y1, vx + x2, vy + y2
+            else:
+                bx1, by1, bx2, by2 = vx + x1, vy + y1, vx + x2, vy + y2
             # 遮罩带 alpha，销毁后要等一帧才真正从屏幕上消失；抢着截图会把
             # 一层 30% 的灰也截进去，等于给自己加了一层水印。
             time.sleep(0.15)
             try:
-                # 遮罩原点 = 虚拟桌面左上角，加上框内偏移就是虚拟桌面坐标
-                self._scan_region_unpack((vx + x1, vy + y1, vx + x2, vy + y2),
-                                         ImageGrab)
+                self._scan_region_unpack((bx1, by1, bx2, by2), ImageGrab)
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror(APP_TITLE, "框选识别失败：\n%s" % exc)
                 self._log("✗ 框选识别失败：%s" % exc)
                 self.root.configure(cursor="")
 
+        def cancel(_e=None):
+            """右键 / Esc 取消：关遮罩并把主窗口放回来。"""
+            try:
+                top.destroy()
+            finally:
+                self._restore_window()
+
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
-        canvas.bind("<Button-3>", lambda _e: top.destroy())     # 右键取消
-        top.bind("<Escape>", lambda _e: top.destroy())
+        canvas.bind("<Button-3>", cancel)                      # 右键取消
+        top.bind("<Escape>", cancel)
         top.focus_force()
+
+    def _restore_window(self):
+        """把主窗口放回来（框选期间会隐藏）。重复调用无害。"""
+        try:
+            if self.root.state() != "normal":
+                self.root.deiconify()
+            self.root.lift()
+        except tk.TclError:
+            pass
+
+    def _save_scan_frame(self, img):
+        """把最后一枪的画面存成 PNG，返回路径。
+
+        「识别不了」光靠描述没法定位：是码太小、框错了地方、还是被别的窗口
+        挡住，看一眼图就知道。失败时静默落盘 + 把路径打进日志。
+        """
+        if img is None:
+            return None
+        try:
+            import tempfile
+
+            name = "officepack_框选抓图_%s.png" % time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(tempfile.gettempdir(), name)
+            img.save(path, "PNG")
+            return path
+        except Exception:  # noqa: BLE001  诊断信息存不下不该影响主流程
+            return None
+
+    @staticmethod
+    def _scale_bbox(bbox, scale):
+        """把逻辑坐标的框换算成物理像素的框；scale≈1 时原样返回。"""
+        if abs(scale - 1.0) <= 0.01:
+            return tuple(bbox)
+        return tuple(int(round(v * scale)) for v in bbox)
+
+    def _grab_scale(self, ImageGrab) -> float:
+        """物理像素 ÷ 逻辑坐标 的比值，用来把框选矩形换算成截图坐标。
+
+        本机实测踩到的坑：物理桌面 **3840×1200**，但 Tk 和 ``GetSystemMetrics``
+        都只说 **3072×960**（125% 缩放）—— 进程拿到的是「逻辑坐标」，而
+        ``ImageGrab`` 抓的是「物理像素」。不换算的话，框在副屏的矩形会整体
+        缩水到 1/1.25 的位置，抓到的是一块空桌面，现象正是
+        「同一块屏能识别、主屏放程序副屏放码就框不准」。
+
+        比值直接由「整屏抓图宽度 ÷ 逻辑虚拟桌面宽度」反推：如果进程真的拿到了
+        per-monitor DPI，这两个数本来就相等，比值为 1，这段换算自动失效。
+        """
+        try:
+            vw = self._virtual_screen()[2]
+            probe = ImageGrab.grab(all_screens=True)
+            width = probe.width
+            probe.close()
+            if vw > 0 and width > 0:
+                return width / float(vw)
+        except Exception:  # noqa: BLE001  抓不到就按 1:1 处理
+            pass
+        return 1.0
 
     def _scan_region_unpack(self, bbox, ImageGrab):
         """框选后盯着这块区域连拍，把动图里一帧帧的码全收下来再还原。
@@ -1015,9 +1105,16 @@ class App:
         界面不会假死。
         """
         self._scan_cancelled = False
-        self._log("· 正在扫描框选区域 %d×%d —— 动图请让它继续在框里循环播放"
+        scale = self._grab_scale(ImageGrab)
+        if abs(scale - 1.0) > 0.01:
+            self._log("· 屏幕缩放 %.0f%%：框选坐标已按物理像素换算"
+                      "（这就是「一块屏能识别、换块屏框不准」的根因）"
+                      % (scale * 100))
+            bbox = self._scale_bbox(bbox, scale)
+        self._scan_bbox = bbox
+        self._log("· 正在扫描框选区域 %d×%d @ (%d,%d) —— 动图请让它继续在框里循环播放"
                   "（首帧开始、尾帧收工，收齐自动停）"
-                  % (bbox[2] - bbox[0], bbox[3] - bbox[1]))
+                  % (bbox[2] - bbox[0], bbox[3] - bbox[1], bbox[0], bbox[1]))
         last = {"t": 0.0}
 
         def grab():
@@ -1038,11 +1135,44 @@ class App:
             except Exception as exc:  # noqa: BLE001
                 self.queue.put(("call", lambda e=exc: self._scan_failed(e)))
                 return
+            if not texts:                      # 框内颗粒无收，整屏兜一次
+                texts, stats = self._rescue_fullscreen(ImageGrab, stats)
             self.queue.put(("call", lambda: self._after_scan(texts, stats)))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _rescue_fullscreen(self, ImageGrab, stats):
+        """框内一张码都没捞着时，整屏再找一遍。
+
+        框错一点、DPI 缩放导致坐标偏移、或者码被切成两半（静区缺一角）都会
+        让框内扫描一无所获，但码其实就在屏幕上。整屏抓一张再扫，能救回这类
+        「明明看得见却识别不了」。只认 officepack 自己的分段（``#OPK1``/``#OPK2``），
+        免得把屏幕上别处的二维码当数据。
+        """
+        try:
+            full = ImageGrab.grab(all_screens=True)
+        except Exception:  # noqa: BLE001
+            return [], stats
+        try:
+            found = qr.decode_image(full, deep=True, keep_markers=True)
+        except Exception:  # noqa: BLE001
+            return [], stats
+        try:
+            keep = [t for t in found if not qr.is_marker(t)
+                    and ct.parse_segments(t)]
+        except Exception:  # noqa: BLE001
+            keep = []
+        if not keep:
+            return [], stats
+        stats = dict(stats)
+        stats["rescue"] = "整屏 %d×%d" % (full.width, full.height)
+        self.queue.put(("log", "· 框内没找到，但在**整屏**里扫到 %d 帧 —— "
+                               "多半是框小了/框偏了，已按整屏结果继续"
+                        % len(keep)))
+        return keep, stats
+
     def _scan_failed(self, exc):
+        self._restore_window()
         self.root.configure(cursor="")
         self._log("✗ 框选扫描失败：%s" % exc)
         messagebox.showerror(APP_TITLE, "框选扫描失败：\n%s" % exc)
@@ -1054,17 +1184,36 @@ class App:
         很正常。与其直接报「缺少第 7 段」让人从头再来，不如把已收到的攒起来，
         再框一次自动补齐 —— 用户不需要知道缺的是哪一帧。
         """
+        self._restore_window()
         self.root.configure(cursor="")
         if not texts:
+            shot = self._save_scan_frame(stats.get("image"))
             self._log("✗ 框选区域没识别到二维码：%.1f 秒 / %d 枪"
                       % (stats["elapsed"], stats["shots"]))
+            img = stats.get("image")
+            want = getattr(self, "_scan_bbox", None)
+            if img is not None and want:
+                got_w, got_h = img.width, img.height
+                ask_w, ask_h = want[2] - want[0], want[3] - want[1]
+                self._log("· 抓到的画面 %d×%d（请求 %d×%d）%s"
+                          % (got_w, got_h, ask_w, ask_h,
+                             "" if (got_w, got_h) == (ask_w, ask_h)
+                             else " ← 尺寸对不上，像是 DPI 缩放导致的错位"))
+            extra = ""
+            if shot:
+                self._log("· 这次框到的画面已存成 %s（可以直接拖进文件列表试试，"
+                          "或发我定位问题）" % shot)
+                extra = ("\n\n这次框到的画面已存成：\n%s\n"
+                         "可以直接把它拖进文件列表，看是不是图本身的问题。"
+                         % shot)
             messagebox.showerror(
                 APP_TITLE,
                 "这块区域里没有识别到完整的二维码。\n\n"
                 "· 动图：让它一直在框里循环播放，别停在中途某一帧\n"
                 "· 码要整个进框，四周留一点白边（静区）\n"
                 "· 显示得太小就放大到 100% 再框\n"
-                "· 还不行就用「粘贴识别面板」，一张一张累加，顺序随意")
+                "· 还不行就用「粘贴识别面板」，一张一张累加，顺序随意"
+                + extra)
             return
 
         seen = set(self._scan_texts)
@@ -1082,6 +1231,19 @@ class App:
         missing = self._missing_frames(self._scan_texts)
         if missing:
             self._log("· %s —— 让动图继续循环，再框一次会自动续上" % missing)
+            # 帧数很多却只收到一两帧、又始终没见到首尾标识帧：框到的是**静态图**
+            # （照片/截图/网页里的一张码）。静态图永远只有 1 帧，再怎么框也补不齐，
+            # 得让用户换路子，而不是让他反复框同一张图。
+            if not stats.get("cycles") and len(self._scan_texts) <= 4:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "只收到 %d 帧，%s\n\n"
+                    "这看起来是一张**静态图**（屏幕上的照片/截图里的一张码）。\n"
+                    "静态图里永远只有 1 帧，再怎么框也补不齐整份文件。\n\n"
+                    "· 要传整份文件：出码时选「PNG + GIF」，让 GIF 在屏幕上循环播放再框\n"
+                    "· 手上只有 PNG：把**总览图**直接拖进文件列表识别，"
+                    "总览里一格就是一帧" % (len(self._scan_texts), missing))
+                return
             messagebox.showwarning(
                 APP_TITLE,
                 "还差几帧，已收的都替你先攒着了。\n\n%s\n\n"
@@ -1608,9 +1770,10 @@ class App:
         )
         frames = qr.build_frames(pack, ec=qr.DEFAULT_EC)
         target_dir = out_dir or os.path.dirname(os.path.abspath(src))
-        want_png = qr_format.startswith("PNG") or "+" in qr_format
+        want_png = qr_format.startswith("PNG")
         want_single = "仅总览" not in qr_format
         want_gif = "GIF" in qr_format and len(frames) > 1
+        want_webp = "WebP" in qr_format and len(frames) > 1
         self.queue.put(("log", "   拆成 %d 张码，开始出图（%s）…"
                         % (len(frames), "渲染 PNG" if want_png else "合成动图")))
 
@@ -1622,16 +1785,25 @@ class App:
             outputs.extend(res["images"])
             outputs.extend(res.get("sheets") or [])
 
+        fps = 3.0
+        try:
+            fps = float(qr_fps)
+        except (TypeError, ValueError):
+            pass
+
         gif_path = None
         if want_gif:
-            try:
-                fps = float(qr_fps)
-            except (TypeError, ValueError):
-                fps = 3.0
             gif_path = os.path.join(target_dir, "%s.qr.gif" % name)
             qr.render_gif(frames, gif_path, ec=qr.DEFAULT_EC, fps=fps,
                           progress=self._qr_progress("合成动图"))
             outputs.append(gif_path)
+
+        webp_path = None
+        if want_webp:
+            webp_path = os.path.join(target_dir, "%s.qr.webp" % name)
+            qr.render_webp(frames, webp_path, ec=qr.DEFAULT_EC, fps=fps,
+                           progress=self._qr_progress("合成 WebP"))
+            outputs.append(webp_path)
 
         meta = pack.meta
         room = qr.single_frame_bytes(qr.DEFAULT_EC, meta["codec"])
@@ -1643,6 +1815,10 @@ class App:
             note = "，另附 %d 页总览图（%s 起）" % (len(sheets), os.path.basename(sheets[0]))
         if gif_path:
             note += "，动图 %s" % os.path.basename(gif_path)
+        if webp_path:
+            note += "，WebP %s（约 %s）" % (
+                os.path.basename(webp_path),
+                _human(os.path.getsize(webp_path)))
         self.queue.put(("log",
             "✅ %s  %s → 压缩后 %s → %d 张二维码（%s，纠错 %s）%s\n   → 目录 %s" % (
                 name, _human(meta["size"]), _human(len(pack.payload)), len(frames),
@@ -1741,6 +1917,27 @@ class App:
                 pass
             self._poll_id = None
         self.root.destroy()
+
+
+def _cursor_pos():
+    """当前鼠标的**物理虚拟桌面坐标**；拿不到返回 None（非 Windows）。
+
+    为什么不用 Tk 的 ``e.x`` / ``e.y`` 去算截图区域：那是窗口客户区坐标，
+    跨屏（尤其两块屏缩放不同）时，Tk 和 Windows 会各自按自己的理解换算一遍，
+    算出来的矩形就和 ``ImageGrab`` 的坐标系对不上 —— 现象正是「同一块屏能
+    识别，主屏放程序、副屏放二维码就框不准」。``GetCursorPos`` 返回的是物理
+    虚拟桌面坐标，和 ``ImageGrab.grab(all_screens=True)`` 用的是同一套，天然对齐。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        pt = wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return int(pt.x), int(pt.y)
+    except Exception:  # noqa: BLE001  非 Windows / 调用失败就走回退路径
+        pass
+    return None
 
 
 def _enable_dpi_awareness() -> None:

@@ -236,11 +236,18 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
                                    sheet=not args.no_sheet, target_px=args.qr_px,
                                    single=not args.no_single, progress=tick)
             gif_path = None
-            if args.qr_gif and len(frames) > 1:
-                gif_path = os.path.join(target_dir, "%s.qr.gif" % stem)
-                qr.render_gif(frames, gif_path, ec=args.qr_ec,
-                              fps=args.qr_gif, target_px=min(args.qr_px, 720),
-                              progress=tick)
+            webp_path = None
+            fps = args.qr_gif or 3.0
+            if len(frames) > 1 and (args.qr_gif or args.qr_webp):
+                if args.qr_gif:
+                    gif_path = os.path.join(target_dir, "%s.qr.gif" % stem)
+                    qr.render_gif(frames, gif_path, ec=args.qr_ec,
+                                  fps=args.qr_gif, target_px=min(args.qr_px, 720),
+                                  progress=tick)
+                if args.qr_webp:
+                    webp_path = os.path.join(target_dir, "%s.qr.webp" % stem)
+                    qr.render_webp(frames, webp_path, ec=args.qr_ec, fps=fps,
+                                   target_px=min(args.qr_px, 720), progress=tick)
         except (qr.QRError, OSError) as exc:
             print("✗ %s：生成二维码失败 %s" % (os.path.basename(src), exc))
             failed += 1
@@ -278,6 +285,10 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
             print("   动图 %s（%.1f 帧/秒，循环播放，首尾带标识帧；"
                   "也能直接当输入丢给 unpack）"
                   % (os.path.basename(gif_path), args.qr_gif))
+        if webp_path:
+            print("   动图 WebP %s（无损，体积约为 GIF 的 1/5；"
+                  "能播它的播放器比 GIF 少，拿不准就用 GIF）"
+                  % os.path.basename(webp_path))
     return 1 if failed else 0
 
 
@@ -486,6 +497,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pack.add_argument("--qr-gif", type=float, nargs="?", const=3.0, default=0.0,
                         metavar="FPS",
                         help="额外输出循环播放的 GIF 动图（默认 3 帧/秒），适合手机对着屏幕扫")
+    p_pack.add_argument("--qr-webp", action="store_true",
+                        help="额外输出**无损动图 WebP**：逐像素无损，体积约为 GIF 的 1/5；"
+                             "代价是能播它的播放器比 GIF 少（Windows 照片/微信可能只显示首帧）")
     add_pack_opts(p_pack)
     p_pack.set_defaults(func=cmd_pack)
 

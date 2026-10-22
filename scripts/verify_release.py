@@ -247,11 +247,13 @@ def test_qr_preset_and_gif(srcdir: str, samples: dict[str, bytes]) -> str:
             if n.lower().endswith(".png") and "all" not in n.lower()]
     gif_path = os.path.join(outdir, gifs[0])
 
-    # 帧数 = 数据帧（一帧一张 PNG）+ 首尾两张标识帧
-    import struct
-    with open(gif_path, "rb") as fh:
-        raw = fh.read()
-    gif_frames = raw.count(b"\x21\xf9\x04")     # 图形控制扩展 = 每帧一个
+    # 帧数 = 数据帧（一帧一张 PNG）+ 首尾两张标识帧。
+    # 必须让 PIL 自己数：以前对着字节流数「图形控制扩展」魔数（21 F9 04），
+    # LZW 压缩数据里凑巧出现这三个字节就会多数一帧 —— 这是个会偶发误报的假断言。
+    from PIL import Image
+
+    with Image.open(gif_path) as im:
+        gif_frames = getattr(im, "n_frames", 1)
     if gif_frames != len(pngs) + 2:
         raise RuntimeError("GIF 帧数 %d ≠ 数据帧 %d + 首尾标识 2"
                            % (gif_frames, len(pngs)))

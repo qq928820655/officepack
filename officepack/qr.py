@@ -456,24 +456,85 @@ def render_gif(
         raise QRError("没有可渲染的帧")
     if len(frames) == 1:
         raise QRError("只有一帧，用静态图就够了，不需要动图")
-    fps = max(0.5, min(10.0, float(fps)))
-    duration = int(round(1000.0 / fps))
-
-    texts = list(frames)
-    marks = _mark_texts(frames) if markers else None
-    if marks:
-        # 首帧 S 在前、尾帧 E 在后：识别端见 S 开始收，见 E 收工
-        texts = [marks[0]] + texts + [marks[1]]
+    duration = _anim_duration(fps)
 
     # 边出图边转调色板：GIF 必须一次性拿到所有帧（PIL 的 save_all 要完整列表），
     # 但 L 模式的中间图可以用完就丢，峰值内存只多一份 P 图。
-    images = [_bilevel(im) for im in
-              _iter_uniform(texts, ec, target_px, progress=progress)]
+    images = [_bilevel(im)
+              for im in _anim_source(frames, ec, target_px, markers, progress)]
     images[0].save(
         out_path, "GIF", save_all=True, append_images=images[1:],
         duration=duration, loop=0, optimize=True, disposal=2,
     )
     return out_path
+
+
+#: WebP 动图的编码档位。``method`` 是 libwebp 的速度/压缩权衡（0 最快、6 最狠），
+#: 实测 4 是拐点：再往上（6）压缩率只多 0.1%，耗时却从 80ms/帧 涨到 5.3s/帧。
+WEBP_METHOD = 4
+
+
+def render_webp(
+    frames: Sequence[str],
+    out_path: str,
+    ec: str = DEFAULT_EC,
+    fps: float = 3.0,
+    target_px: int = 720,
+    markers: bool = True,
+    progress=None,
+    method: int = WEBP_METHOD,
+) -> str:
+    """把多帧合成一张**循环播放的动图 WebP**（无损），体积约为 GIF 的 1/5。
+
+    为什么能小这么多：GIF 的 LZW 是「按行」找重复串，二维码每行图案都不一样，
+    于是几乎压不动（实测 33KB/帧）；WebP 无损走的是空间预测 + 熵编码，同尺寸
+    逐像素无损还能压到 6.4KB/帧。
+
+    但**默认不用它**，因为播放兼容性远不如 GIF：
+    - 浏览器、Chrome、Edge、现代看图工具：能播
+    - Windows「照片」、微信、部分看图软件：可能只显示第一帧
+
+    咱们的流程是「让动图在屏幕/软件里播放，再框选连拍」。播不动就等于产物废掉，
+    所以它只在用户**显式选择**时输出，GIF 仍是默认。
+
+    纠错级别、标识帧、统一画布、帧率语义都和 :func:`render_gif` 完全一致，
+    识别端无需区分 —— 扫的是屏幕像素，不看容器格式。
+    """
+    from PIL import Image, features
+
+    if not features.check("webp"):
+        raise QRError("当前 Pillow 没有 WebP 编码器，无法输出 --qr-webp；"
+                      "请改用 GIF 动图，或安装带 WebP 支持的 Pillow")
+    if not frames:
+        raise QRError("没有可渲染的帧")
+    if len(frames) == 1:
+        raise QRError("只有一帧，用静态图就够了，不需要动图")
+    duration = _anim_duration(fps)
+    # 无损 WebP 直接吃 L 模式原图：它内部自己会做二值友好的预测，不需要调色板
+    images = list(_anim_source(frames, ec, target_px, markers, progress))
+    images[0].save(
+        out_path, "WEBP", save_all=True, append_images=images[1:],
+        duration=duration, loop=0, lossless=True, quality=100, method=method,
+    )
+    return out_path
+
+
+def _anim_duration(fps: float) -> int:
+    """帧率 → 每帧毫秒数；夹在 0.5~10 之间（相机对焦+解码要 150ms 以上）。"""
+    return max(0, int(round(1000.0 / max(0.5, min(10.0, float(fps))))))
+
+
+def _anim_source(frames: Sequence[str], ec: str, target_px: int,
+                 markers: bool, progress):
+    """动图共用：首尾插标识帧 → 统一画布逐帧出图（生成器）。
+
+    首帧 S 在前、尾帧 E 在后：识别端见 S 开始收、见 E 收工，不用猜播放相位。
+    """
+    texts = list(frames)
+    marks = _mark_texts(frames) if markers else None
+    if marks:
+        texts = [marks[0]] + texts + [marks[1]]
+    return _iter_uniform(texts, ec, target_px, progress=progress)
 
 
 def _save_png(job) -> str:
@@ -888,7 +949,11 @@ def _looks_complete(texts: list[str]) -> bool:
 SCAN_INTERVAL = 0.05
 SCAN_IDLE = 3.0
 SCAN_CAP = 30.0
-SCAN_EMPTY_SHOTS = 6
+#: 连开几枪一张码都没见着就提前收工。别定太小：整屏抓图 + 解码一枪约
+#: 0.2 秒（多屏时 ``all_screens=True`` 要先把整个虚拟桌面抓下来再裁），
+#: 6 枪只有 1.3 秒 —— 屏幕刚好在这一瞬刷新/滚动就白判了。10 枪约 2 秒，
+#: 仍能很快报「框错了地方」，又不至于一枪不中就放弃。
+SCAN_EMPTY_SHOTS = 10
 #: 连拍结束后对最后一张图做全力重试的预算
 SCAN_DEEP_BUDGET = 4.0
 
@@ -974,6 +1039,15 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
                     found = decode_image(img, fast=True, keep_markers=True)
                 except Exception:  # noqa: BLE001
                     found = []
+                if not found and not texts and shots <= 3:
+                    # 裸读一枪没中：屏幕上显示的码经过缩放插值（125% 缩放 = 双线性
+                    # 拉伸），往往就差一口气。前几枪换便宜的重试再来一次
+                    # （阈值/放大/切块），别坐等到收工才拿最后一帧深挖 ——
+                    # 静态画面下画面不变就不会再解码，第一次失手等于永久漏帧。
+                    try:
+                        found = _read_one(img, deep=False)
+                    except Exception:  # noqa: BLE001
+                        found = []
                 data: list[str] = []
                 for text in found:
                     mk = parse_marker(text)
@@ -1017,7 +1091,10 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
             complete = _looks_complete(texts)
 
     return texts, {"shots": shots, "frames": len(texts), "cycles": starts,
-                   "complete": complete, "elapsed": time.monotonic() - started}
+                   "complete": complete, "elapsed": time.monotonic() - started,
+                   # 最后一枪的画面：一无所获时调用方可以存下来，让「识别不了」
+                   # 有据可查 —— 光靠嘴说定位不了是码太糊、框错地方还是被窗口挡了。
+                   "image": last_img}
 
 
 def _otsu(img):

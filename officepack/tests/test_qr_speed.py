@@ -221,5 +221,53 @@ class GarbageTextTest(unittest.TestCase):
             ct.unpack_texts(["B40B"], out_dir=os.path.join(self.tmp, "p"))
 
 
+class WebpAnimationTest(unittest.TestCase):
+    """动图 WebP：逐像素无损、体积约为 GIF 的 1/5，且能直接当输入还原。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="opk-webp-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.raw = random.Random(11).randbytes(20000)
+        self.pack = ct.pack_bytes(self.raw, "w.bin", codec_name="qr45",
+                                  compress="none", cipher_name="none",
+                                  preview=False)
+        self.frames = qr.build_frames(self.pack, "L")
+
+    def test_webp_is_pixel_lossless(self):
+        """无损 WebP 的数据帧必须和直接渲染的位图**逐像素**一致。
+
+        有损一档会毁了二维码（实测 q90 的体积反而是无损的 4 倍，块效应把
+        黑白格子弄脏），所以这里盯死「无损」这条线。
+        """
+        from PIL import Image, ImageSequence
+
+        path = os.path.join(self.tmp, "a.webp")
+        qr.render_webp(self.frames, path, "L", fps=3, target_px=400)
+        want = [im.tobytes() for im in qr._render_uniform(self.frames, "L", 400)]
+        with Image.open(path) as im:
+            got = [f.convert("L").tobytes() for f in ImageSequence.Iterator(im)]
+        self.assertEqual(len(got), len(want) + 2, "首尾标识帧不见了")
+        self.assertEqual(got[1:-1], want, "WebP 动了像素，不是无损")
+
+    def test_webp_is_much_smaller_than_gif(self):
+        """同样内容，WebP 要比 GIF 小得多（实测 5 倍上下，这里卡 2 倍）。"""
+        gif = os.path.join(self.tmp, "a.gif")
+        webp = os.path.join(self.tmp, "a.webp")
+        qr.render_gif(self.frames, gif, "L", fps=3, target_px=400)
+        qr.render_webp(self.frames, webp, "L", fps=3, target_px=400)
+        self.assertLess(os.path.getsize(webp) * 2, os.path.getsize(gif),
+                        "WebP 没比 GIF 小一半，压缩没生效")
+
+    def test_webp_can_be_decoded_and_unpacked(self):
+        """动图 WebP 也是合法输入：识别、还原要和 GIF 一样走通。"""
+        path = os.path.join(self.tmp, "b.webp")
+        qr.render_webp(self.frames, path, "L", fps=3, target_px=400)
+        self.assertEqual(len(qr.decode_image(path)), len(self.frames))
+        results = qr.unpack_images([path], out_dir=os.path.join(self.tmp, "o"))
+        self.assertEqual(len(results), 1)
+        with open(results[0][0], "rb") as fh:
+            self.assertEqual(fh.read(), self.raw)
+
+
 if __name__ == "__main__":
     unittest.main()

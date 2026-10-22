@@ -297,6 +297,33 @@ class ScanRegionTest(unittest.TestCase):
         self.assertFalse(stats["complete"])
         self.assertLess(stats["elapsed"], 8.0, "空白区域磨太久")
 
+    def test_fast_miss_is_retried_on_the_same_frame(self):
+        """裸读失手不能等于永久漏帧：前几枪必须换个法子再试一次。
+
+        真实场景：屏幕 125% 缩放下，码是被双线性拉伸过的，``fast`` 只跑原图
+        经常差一口气。而画面不变时 ``_frame_key`` 会跳过解码 —— 第一枪失手，
+        后面每一枪都不会再看它，于是「明明在屏幕上却识别不了」。
+        """
+        from PIL import Image
+
+        blank = Image.new("RGB", (420, 420), "white")
+        real = qr._read_one
+        calls = {"n": 0}
+
+        def fake_read(img, deep=True, fast=False, budget=None):
+            calls["n"] += 1
+            return ["#OPK1 000000 001/001 AB\nDATA"]
+
+        qr._read_one = fake_read
+        try:
+            texts, stats = qr.scan_region(lambda: blank, idle=1.0,
+                                          interval=0.0, cap=5.0)
+        finally:
+            qr._read_one = real
+        self.assertTrue(texts, "快扫失手后没有重试，等于永久漏帧")
+        self.assertLessEqual(calls["n"], 3, "重试次数失控，动图会被拖慢")
+        self.assertLessEqual(stats["shots"], 4, "不是在前几枪就补救的")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -244,7 +244,8 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
         if len(sheets) > 1:
             print("   共 %d 帧 / %d 页总览图，截图按页来最省事" % (len(frames), len(sheets)))
         if gif_path:
-            print("   动图 %s（%.1f 帧/秒，循环播放；也能直接当输入丢给 unpack）"
+            print("   动图 %s（%.1f 帧/秒，循环播放，首尾带标识帧；"
+                  "也能直接当输入丢给 unpack）"
                   % (os.path.basename(gif_path), args.qr_gif))
     return 1 if failed else 0
 

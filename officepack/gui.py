@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -129,13 +130,16 @@ HELP: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
                    "压缩后约 2.4KB；超过就必然是多张，这是二维码标准的物理上限。"),
             ("PNG（单帧 + 总览）", "每帧一张 PNG，另附总览图（每页 12 帧，多页自动续）。\n"
                                   "总览图一张就能把整页帧全带回来，电脑上还原最快。"),
-            ("GIF 动图", "把全部帧合成一张循环播放的动图，适合手机对着屏幕扫。\n"
+            ("GIF 动图", "把全部帧合成一张循环播放的动图，适合手机扫或电脑框选。\n"
+                        "首尾各有一张标识帧：框选时「见首帧开始收、见尾帧收工」，\n"
+                        "所以边播边扫也能确认一轮到底有没有收全。\n"
                         "二维码只有黑白两色，GIF 对它是**完全无损**的，数据不会掉；\n"
-                        "体积约等于同样分辨率的 PNG（黑白图没法靠帧间压缩再省）。\n"
                         "帧率别贪高：相机对焦+解码要 150ms 以上，2~4 帧/秒最稳。"),
             ("PNG + GIF", "两种都出。先拿总览图在电脑上还原；手机端用动图。" ),
             ("帧/秒", "动图播放速度。太快手机跟不上会更漏帧，太慢要等太久；3 最好用。"),
-            ("back", "还原：点「还原二维码 → 框选屏幕区域」，拖框圈住码，松开就识别；\n"
+            ("back", "还原：点「还原二维码 → 框选屏幕区域」，拖框圈住码，松开就连拍识别；\n"
+                     "动图请让它一直在框里循环播放 —— 同一块区域会连拍到你收齐为止，\n"
+                     "漏的帧再框一次会自动续上（累计不会重复）。\n"
                      "也可以读剪贴板截图、选图片文件，或直接把 PNG/GIF 拖进列表。\n"
                      "顺序无关：每帧都带序号和校验，扫到哪帧收哪帧。"),
         ],
@@ -160,6 +164,8 @@ class App:
         self.queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.last_out_dir: str | None = None   # 上一轮实际写出文件的目录
+        self._scan_texts: list[str] = []       # 框选连拍的累计帧（多次框选可续上）
+        self._scan_cancelled = False
         self._log_lines = 6                    # 日志框行数，屏幕不够时会被自动压缩
         self._poll_id: str | None = None       # 队列轮询的 after id
 
@@ -849,12 +855,88 @@ class App:
         except tk.TclError:
             pass
 
+    @staticmethod
+    def _monitors() -> list[tuple[int, int, int, int]]:
+        """枚举所有显示器矩形（虚拟桌面坐标；主屏左侧的副屏是负坐标）。"""
+        rects: list[tuple[int, int, int, int]] = []
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                            ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+            proto = ctypes.WINFUNCTYPE(ctypes.c_int, wt.HMONITOR, wt.HDC,
+                                       ctypes.POINTER(wt.RECT), wt.LPARAM)
+
+            def _cb(hmon, hdc, lprc, data):
+                info = MONITORINFO()
+                info.cbSize = ctypes.sizeof(MONITORINFO)
+                if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                    r = info.rcMonitor
+                    if r.right - r.left > 100 and r.bottom - r.top > 100:
+                        rects.append((r.left, r.top, r.right, r.bottom))
+                return 1
+
+            ctypes.windll.user32.EnumDisplayMonitors(None, None, proto(_cb), 0)
+        except Exception:  # noqa: BLE001  非 Windows / 老系统
+            pass
+        return rects
+
+    def _virtual_screen(self) -> tuple[int, int, int, int]:
+        """整个虚拟桌面 (x, y, 宽, 高)：多屏时横跨所有显示器，左/上可能是负数。"""
+        try:
+            import ctypes
+
+            u32 = ctypes.windll.user32
+            x, y = u32.GetSystemMetrics(76), u32.GetSystemMetrics(77)   # SM_X/YVIRTUALSCREEN
+            w, h = u32.GetSystemMetrics(78), u32.GetSystemMetrics(79)   # SM_CX/CYVIRTUALSCREEN
+            if w > 100 and h > 100:
+                return x, y, w, h
+        except Exception:  # noqa: BLE001
+            pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _build_overlay(self):
+        """铺一层盖住**所有**显示器的半透明遮罩，返回 (窗口, 画布, x, y, 宽, 高)。
+
+        关键是铺「整个虚拟桌面」而不是鼠标所在那一块：只铺一块时，另一块屏幕
+        既不暗、点上去也没反应，双屏用户会以为功能坏了。铺满之后哪块屏都能框，
+        甚至能拖一个横跨两块屏的框。
+        """
+        vx, vy, vw, vh = self._virtual_screen()
+        mons = self._monitors() or [(vx, vy, vx + vw, vy + vh)]
+
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        try:
+            top.attributes("-alpha", 0.32)      # 半透明遮罩，能看见底下的码
+        except tk.TclError:
+            pass
+        top.configure(bg="black")
+        top.geometry("%dx%d+%d+%d" % (vw, vh, vx, vy))
+
+        canvas = tk.Canvas(top, bg="black", highlightthickness=0, cursor="cross",
+                           width=vw, height=vh)
+        canvas.pack(fill="both", expand=True)
+        # 每块屏幕顶部各放一条提示：双屏时不用来回找「提示在哪」
+        font = ("Microsoft YaHei UI", 13)
+        for ml, mt, mr, mb in mons:
+            canvas.create_text((ml + mr) // 2 - vx, 46,
+                               fill="#ffffff", font=font,
+                               text="拖框圈住二维码 · 松开即识别 · Esc 或右键取消")
+        top.update_idletasks()
+        self._place_overlay(top, vx, vy, vw, vh)
+        return top, canvas, vx, vy, vw, vh
+
     def grab_region(self):
         """框选屏幕区域 → 截图 → 识别二维码 → 直接还原。
 
         比「先截图存文件再选文件」少两步：屏幕上有码，拖一个框就完事。
-        **多屏**：遮罩铺在鼠标所在的那块屏幕上（主屏/副屏都行），
-        抓图按虚拟桌面坐标取，副屏在左边导致的负坐标也照常工作。
+        **多屏**：遮罩铺满整个虚拟桌面，主屏/副屏都能框，跨屏拖框也支持；
+        抓图按虚拟桌面坐标取（副屏在左边导致的负坐标同样正确）。
         """
         try:
             from PIL import ImageGrab
@@ -862,62 +944,159 @@ class App:
             messagebox.showerror(APP_TITLE, "缺少 Pillow，无法截图：%s" % exc)
             return
 
-        ml, mt, mr, mb = self._cursor_monitor()
-        sw, sh = mr - ml, mb - mt
-
-        top = tk.Toplevel(self.root)
-        top.overrideredirect(True)
-        top.attributes("-topmost", True)
-        try:
-            top.attributes("-alpha", 0.30)      # 半透明遮罩，能看见底下的码
-        except tk.TclError:
-            pass
-        top.geometry("%dx%d+0+0" % (sw, sh))
-        top.configure(bg="black")
-
-        canvas = tk.Canvas(top, bg="black", highlightthickness=0, cursor="cross")
-        canvas.pack(fill="both", expand=True)
-        canvas.create_text(sw // 2, 40, fill="white", font=("Microsoft YaHei UI", 14),
-                           text="拖框圈住二维码 · 松开即识别 · Esc 取消")
-        top.update_idletasks()
-        self._place_overlay(top, ml, mt, sw, sh)
-
+        top, canvas, vx, vy, vw, vh = self._build_overlay()
         box = {"x0": 0, "y0": 0, "rect": None}
 
+        def clamp_x(x):
+            return max(0, min(int(x), vw))
+
+        def clamp_y(y):
+            return max(0, min(int(y), vh))
+
         def on_press(e):
-            box["x0"], box["y0"] = e.x, e.y
-            box["rect"] = canvas.create_rectangle(e.x, e.y, e.x, e.y,
-                                                  outline="#ff3b30", width=2)
+            box["x0"], box["y0"] = clamp_x(e.x), clamp_y(e.y)
+            box["rect"] = canvas.create_rectangle(box["x0"], box["y0"], box["x0"],
+                                                  box["y0"], outline="#ff3b30", width=2)
 
         def on_drag(e):
             if box["rect"] is not None:
-                canvas.coords(box["rect"], box["x0"], box["y0"], e.x, e.y)
+                canvas.coords(box["rect"], box["x0"], box["y0"],
+                              clamp_x(e.x), clamp_y(e.y))
 
         def on_release(e):
-            x1, x2 = sorted((box["x0"], e.x))
-            y1, y2 = sorted((box["y0"], e.y))
+            if box["rect"] is None:               # 右键取消时窗口已销毁
+                return
+            x1, x2 = sorted((box["x0"], clamp_x(e.x)))
+            y1, y2 = sorted((box["y0"], clamp_y(e.y)))
+            box["rect"] = None
             top.destroy()
             if x2 - x1 < 24 or y2 - y1 < 24:      # 误点一下，当取消
                 return
             self.root.configure(cursor="watch")
-            self.root.update_idletasks()
+            self.root.update()
+            # 遮罩带 alpha，销毁后要等一帧才真正从屏幕上消失；抢着截图会把
+            # 一层 30% 的灰也截进去，等于给自己加了一层水印。
+            time.sleep(0.15)
             try:
-                # 遮罩的客户区原点 = 该屏左上角，加上屏幕偏移就是虚拟桌面坐标
-                img = ImageGrab.grab(bbox=(ml + x1, mt + y1, ml + x2, mt + y2),
-                                     all_screens=True)
-                self._unpack_qr_image(img, "屏幕框选")
+                # 遮罩原点 = 虚拟桌面左上角，加上框内偏移就是虚拟桌面坐标
+                self._scan_region_unpack((vx + x1, vy + y1, vx + x2, vy + y2),
+                                         ImageGrab)
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror(APP_TITLE, "框选识别失败：\n%s" % exc)
                 self._log("✗ 框选识别失败：%s" % exc)
-            finally:
                 self.root.configure(cursor="")
-                self.root.update_idletasks()
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
+        canvas.bind("<Button-3>", lambda _e: top.destroy())     # 右键取消
         top.bind("<Escape>", lambda _e: top.destroy())
         top.focus_force()
+
+    def _scan_region_unpack(self, bbox, ImageGrab):
+        """框选后盯着这块区域连拍，把动图里一帧帧的码全收下来再还原。
+
+        框选的真正用途就是动图：一张截图只有播放中的某一帧，收不全必然还原
+        不了。连拍放后台线程（静态码第一枪就齐、立刻返回），主线程只刷日志，
+        界面不会假死。
+        """
+        self._scan_cancelled = False
+        self._log("· 正在扫描框选区域 %d×%d —— 动图请让它继续在框里循环播放"
+                  "（首帧开始、尾帧收工，收齐自动停）"
+                  % (bbox[2] - bbox[0], bbox[3] - bbox[1]))
+        last = {"t": 0.0}
+
+        def grab():
+            return ImageGrab.grab(bbox=bbox, all_screens=True)
+
+        def report(st):
+            # 日志别刷屏：约每 0.5 秒一行，且只在真有新帧时才说
+            if st["frames"] and st["elapsed"] - last["t"] >= 0.5:
+                last["t"] = st["elapsed"]
+                self.queue.put(("log", "  已抓 %d 枪，收到 %d 帧…"
+                                % (st["shots"], st["frames"])))
+
+        def worker():
+            try:
+                texts, stats = qr.scan_region(
+                    grab, on_progress=report,
+                    should_stop=lambda: self._scan_cancelled)
+            except Exception as exc:  # noqa: BLE001
+                self.queue.put(("call", lambda e=exc: self._scan_failed(e)))
+                return
+            self.queue.put(("call", lambda: self._after_scan(texts, stats)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_failed(self, exc):
+        self.root.configure(cursor="")
+        self._log("✗ 框选扫描失败：%s" % exc)
+        messagebox.showerror(APP_TITLE, "框选扫描失败：\n%s" % exc)
+
+    def _after_scan(self, texts, stats):
+        """连拍结束：够帧就还原，不够就把这一轮收进累计区，等下一次框选续上。
+
+        动图的播放速度、屏幕刷新和我们的抓图节奏不一定对得上，一轮漏掉一帧
+        很正常。与其直接报「缺少第 7 段」让人从头再来，不如把已收到的攒起来，
+        再框一次自动补齐 —— 用户不需要知道缺的是哪一帧。
+        """
+        self.root.configure(cursor="")
+        if not texts:
+            self._log("✗ 框选区域没识别到二维码：%.1f 秒 / %d 枪"
+                      % (stats["elapsed"], stats["shots"]))
+            messagebox.showerror(
+                APP_TITLE,
+                "这块区域里没有识别到完整的二维码。\n\n"
+                "· 动图：让它一直在框里循环播放，别停在中途某一帧\n"
+                "· 码要整个进框，四周留一点白边（静区）\n"
+                "· 显示得太小就放大到 100% 再框\n"
+                "· 还不行就用「粘贴识别面板」，一张一张累加，顺序随意")
+            return
+
+        seen = set(self._scan_texts)
+        fresh = [t for t in texts if t not in seen]
+        # 换了一份文件就别再跟上一份攒的帧混在一起，否则永远「缺上一份的第 N 帧」
+        if fresh and self._scan_texts and not (self._scan_docs(fresh)
+                                               & self._scan_docs(self._scan_texts)):
+            self._log("· 框到的是另一份文件，之前攒的帧作废")
+            self._scan_texts = []
+        self._scan_texts.extend(fresh)
+        self._log("· 本轮扫描：%d 枪 / %.1f 秒 / %d 轮，新收 %d 帧（累计 %d 帧）"
+                  % (stats["shots"], stats["elapsed"], stats.get("cycles", 0),
+                     len(fresh), len(self._scan_texts)))
+
+        missing = self._missing_frames(self._scan_texts)
+        if missing:
+            self._log("· %s —— 让动图继续循环，再框一次会自动续上" % missing)
+            messagebox.showwarning(
+                APP_TITLE,
+                "还差几帧，已收的都替你先攒着了。\n\n%s\n\n"
+                "让动图继续循环播放，再框一次同一块区域即可自动补上（不必从头来）。"
+                % missing)
+            return
+
+        texts, self._scan_texts = list(self._scan_texts), []
+        try:
+            results = self._unpack_frames(texts, "屏幕框选")
+        except Exception as exc:  # noqa: BLE001
+            self._log("✗ 还原失败：%s" % exc)
+            messagebox.showerror(APP_TITLE, "还原失败：\n%s" % exc)
+            return
+        if messagebox.askyesno(
+            APP_TITLE,
+            "已从屏幕框选还原 %d 个文件\n\n%s\n\n打开所在文件夹？"
+            % (len(results), self.last_out_dir),
+        ):
+            self.open_out_dir()
+
+    @staticmethod
+    def _scan_docs(texts) -> set:
+        """这批帧属于哪些文档（按段头 doc_id），用来判断「是不是同一份文件」。"""
+        try:
+            segs = ct.parse_segments("\n".join(texts))
+        except Exception:  # noqa: BLE001
+            return set()
+        return {seg.doc_id for seg in segs}
 
     def _missing_frames(self, texts) -> str:
         """按段头算还缺哪些帧，返回一句人话（齐了就返回空串）。"""
@@ -1393,7 +1572,7 @@ class App:
                 % (_human(room), _human(len(pack.payload)), len(frames))))
         if gif_path:
             self.queue.put(("log",
-                "   动图可循环播放，手机对着屏幕录一段或边看边扫就行；"
+                "   动图可循环播放（首尾带标识帧，框选时能判断一轮起止）；"
                 "把 gif 丢进「还原二维码 → 选择图片文件」也能直接读全帧"))
         if not want_png:
             self.queue.put(("log", "   （本次只输出动图，未写单帧 PNG）"))
@@ -1451,6 +1630,8 @@ class App:
                     self.progress.step(payload)
                 elif kind == "done":
                     self._finish(payload)
+                elif kind == "call":
+                    payload()          # 工作线程派回主线程的回调（弹窗必须在主线程）
         except queue.Empty:
             pass
         self._poll_id = self.root.after(120, self._poll_queue)
@@ -1467,12 +1648,27 @@ class App:
 
 
 def _enable_dpi_awareness() -> None:
-    """让进程感知 DPI：不设的话，150% 缩放下框选屏幕的坐标和截图会错位。"""
+    """让进程感知 DPI：不设的话，150% 缩放下框选屏幕的坐标和截图会错位。
+
+    双屏且缩放不同（本机主屏 125%、副屏 100%）时，必须用
+    ``PER_MONITOR_AWARE_V2``：V1 下面 Windows 会把跨屏窗口按主屏缩放虚拟化，
+    遮罩和截图就会错位。V2 拿不到（Win7/8）再退回 shcore 的 V1。
+    """
+    try:
+        import ctypes
+
+        u32 = ctypes.windll.user32
+        if hasattr(u32, "SetProcessDpiAwarenessContext"):
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            if u32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+    except Exception:  # 非 Windows / 老系统
+        pass
     try:
         import ctypes
 
         ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PROCESS_PER_MONITOR_DPI_AWARE
-    except Exception:  # 非 Windows / 老系统
+    except Exception:
         pass
 
 

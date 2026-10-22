@@ -185,5 +185,118 @@ class ClipboardModuleTest(unittest.TestCase):
         self.assertTrue(all(os.path.isabs(d) for d in dirs[:5]))
 
 
+class ScanRegionTest(unittest.TestCase):
+    """框选连拍：一张截图只有动图里的一帧，必须连着抓才能收全。
+
+    这是 v1.4.1 的回归点：框选以前只抓一张就解码，碰上正在播放的动图必然
+    只得到 1/N 帧，表现为「框选了也识别不出来」。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PIL import Image
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.dir = cls.tmp.name
+        cls.frames, cls.raw = _make_frames(14000)
+        res = qr.render_images(cls.frames, cls.dir, "scan", ec="M",
+                               sheet=False, target_px=720)
+        cls.images = []
+        for path in res["images"]:
+            with Image.open(path) as im:
+                cls.images.append(im.convert("RGB"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def _cycler(images, repeat=2):
+        """模拟「屏幕上的动图正在循环播放」：每次抓图给下一帧。"""
+        seq = list(images) * repeat
+        state = {"i": 0}
+
+        def grab():
+            img = seq[min(state["i"], len(seq) - 1)]
+            state["i"] += 1
+            return img
+
+        return grab
+
+    def test_animation_frames_are_all_collected(self):
+        """动图：连拍应收全所有帧并判定收齐，还原后逐字节一致。"""
+        self.assertGreater(len(self.frames), 2, "样本太少，测不出连拍价值")
+        texts, stats = qr.scan_region(self._cycler(self.images),
+                                      idle=0.5, interval=0.0, cap=30)
+        self.assertTrue(stats["complete"], "没判成收齐：%r" % (stats,))
+        self.assertGreaterEqual(len(texts), len(self.frames))
+        out = os.path.join(self.dir, "out_scan")
+        results = ct.unpack_texts(texts, out)
+        with open(results[0][0], "rb") as fh:
+            self.assertEqual(fh.read(), self.raw)
+
+    def test_static_code_returns_immediately(self):
+        """完整单码：第一枪就齐，不该傻等 idle 秒（否则每次框选都卡 2 秒）。"""
+        raw = b"officepack one frame sample" * 2
+        pack = ct.pack_bytes(raw, "one.txt", codec_name="qr45", cipher_name="none",
+                             password=None, compress="max", preview=False,
+                             ascii_only=True)
+        frames = qr.build_frames(pack, ec="M")
+        self.assertEqual(len(frames), 1, "样本压不成单帧，测试前提不成立")
+        res = qr.render_images(frames, self.dir, "one", ec="M",
+                               sheet=False, target_px=480)
+        from PIL import Image
+
+        with Image.open(res["images"][0]) as im:
+            still = im.convert("RGB")
+        texts, stats = qr.scan_region(lambda: still, idle=5.0, interval=0.0)
+        self.assertTrue(stats["complete"])
+        self.assertEqual(len(texts), 1)
+        self.assertLessEqual(stats["shots"], 2, "静态码不该连拍")
+        self.assertLess(stats["elapsed"], 2.0, "静态码不该等待")
+
+    def test_gif_has_start_and_end_markers(self):
+        """动图首尾各插一张标识帧：识别端靠它判断一轮从哪开始、到哪结束。"""
+        gif = qr.render_gif(self.frames, os.path.join(self.dir, "marked.gif"),
+                            ec="M", fps=3, target_px=480)
+        plain = qr.decode_image(gif)
+        self.assertFalse([t for t in plain if qr.is_marker(t)],
+                         "还原路径不该看到标识帧")
+        self.assertEqual(len(plain), len(self.frames))
+        marked = qr.decode_image(gif, keep_markers=True)
+        kinds = [qr.parse_marker(t) for t in marked if qr.is_marker(t)]
+        self.assertEqual([k[0] for k in kinds], ["S", "E"], "首尾标识帧缺失")
+        self.assertEqual(kinds[0][2], len(self.frames), "首帧里的总帧数不对")
+
+    def test_scan_with_markers_finishes_in_one_cycle(self):
+        """带标识的动图：见首帧开始、到尾帧收齐，一轮就够，不用等超时。"""
+        from PIL import Image
+
+        gif = qr.render_gif(self.frames, os.path.join(self.dir, "cycle.gif"),
+                            ec="M", fps=3, target_px=600)
+        seq = []
+        with Image.open(gif) as im:
+            for i in range(im.n_frames):
+                im.seek(i)
+                seq.append(im.convert("RGB"))
+        self.assertEqual(len(seq), len(self.frames) + 2, "首尾标识帧没写进 GIF")
+        texts, stats = qr.scan_region(self._cycler(seq, repeat=3),
+                                      idle=5.0, interval=0.0, cap=30)
+        self.assertTrue(stats["complete"], "一轮没收齐：%r" % (stats,))
+        self.assertEqual(len(texts), len(self.frames))
+        self.assertFalse([t for t in texts if qr.is_marker(t)], "标识帧混进了数据")
+        self.assertLessEqual(stats["cycles"], 1, "本该一轮收齐")
+
+    def test_blank_region_gives_up_quickly(self):
+        """框错了地方：不能磨很久，也不能抛异常。"""
+        from PIL import Image
+
+        blank = Image.new("RGB", (420, 420), "white")
+        texts, stats = qr.scan_region(lambda: blank, idle=0.3, interval=0.0)
+        self.assertEqual(texts, [])
+        self.assertFalse(stats["complete"])
+        self.assertLess(stats["elapsed"], 8.0, "空白区域磨太久")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,8 @@ class LayoutTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
+            # 和真实启动一致：先声明 DPI 感知，否则多屏不同缩放时坐标会被虚拟化
+            gui_mod._enable_dpi_awareness()
             cls.root = tk.Tk()
         except tk.TclError as exc:      # pragma: no cover
             raise unittest.SkipTest("无法创建 Tk 窗口：%s" % exc)
@@ -127,6 +129,20 @@ class LayoutTest(unittest.TestCase):
         self.app.qr_enabled.set(False)
         self.app._on_qr_toggle()
 
+    def test_queue_call_runs_in_main_thread(self):
+        """工作线程派回主线程的 call 必须真的执行 —— 框选扫描靠它收尾。"""
+        hit = []
+        self.app.queue.put(("call", lambda: hit.append(1)))
+        self.app._poll_queue()
+        self.assertTrue(hit, "队列里的 call 回调没有被执行")
+
+    def test_scan_buffer_accumulates_frames(self):
+        """两次框选要能累加：漏帧时再框一次就补上，不必从头来。"""
+        part = ["#OPK1 aaa 001/002 x 10\nAAA"]
+        self.assertIn("缺第 2 帧", self.app._missing_frames(part))
+        merged = part + ["#OPK1 aaa 002/002 x 10\nBBB"]
+        self.assertEqual(self.app._missing_frames(merged), "")
+
     def test_file_kind_labels(self):
         """表格里的类型列要能认出源码 / 压缩包 / PDF。"""
         self.assertEqual(gui_mod.preview_mod.kind_of(".java"), "纯文本/源码")
@@ -135,13 +151,58 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(gui_mod.preview_mod.kind_of(".exe"), "可执行/库")
 
     def test_cursor_monitor_returns_screen_rect(self):
-        """框选要覆盖鼠标所在那块屏：矩形必须真实可框，不能是 0×0。"""
+        """鼠标所在显示器的矩形必须真实可框，不能是 0×0。"""
         left, top, right, bottom = self.app._cursor_monitor()
         self.assertGreater(right - left, 100, "屏幕宽度异常：%r" % ((left, top, right, bottom),))
         self.assertGreater(bottom - top, 100, "屏幕高度异常：%r" % ((left, top, right, bottom),))
         # 副屏在主屏左边时 left 是负的，这正是「支持多屏」的关键
         self.assertGreaterEqual(right, 0)
         self.assertGreaterEqual(bottom, 0)
+
+    def test_virtual_screen_wraps_every_monitor(self):
+        """虚拟桌面必须包住所有显示器 —— 少包一块，那块屏就框不了。"""
+        mons = self.app._monitors()
+        self.assertTrue(mons, "枚举不到任何显示器")
+        vx, vy, vw, vh = self.app._virtual_screen()
+        for ml, mt, mr, mb in mons:
+            self.assertGreaterEqual(ml, vx, "显示器左边界溢出了虚拟桌面")
+            self.assertGreaterEqual(mt, vy, "显示器上边界溢出了虚拟桌面")
+            self.assertLessEqual(mr, vx + vw, "显示器右边界溢出了虚拟桌面")
+            self.assertLessEqual(mb, vy + vh, "显示器下边界溢出了虚拟桌面")
+
+    def test_overlay_window_covers_all_monitors(self):
+        """框选遮罩必须盖住**所有**屏幕，而不是只有鼠标所在那一块。
+
+        这是 v1.4.0 的回归点：旧的实现按「鼠标所在显示器」铺遮罩，双屏时
+        另一块屏不暗、点上去也没反应，用户会以为功能坏了。
+        """
+        import ctypes
+        import ctypes.wintypes as wt
+
+        top, canvas, vx, vy, vw, vh = self.app._build_overlay()
+        try:
+            self.root.update()
+            u32 = ctypes.windll.user32
+            hwnd = top.winfo_id()
+            frame = u32.GetParent(hwnd) or hwnd
+            rect = wt.RECT()
+            self.assertTrue(u32.GetWindowRect(frame, ctypes.byref(rect)),
+                            "拿不到遮罩窗口矩形")
+            got = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+            self.assertEqual(got, (vx, vy, vw, vh),
+                             "遮罩没铺满虚拟桌面：实际 %r，应为 %r"
+                             % (got, (vx, vy, vw, vh)))
+            for ml, mt, mr, mb in self.app._monitors():
+                self.assertTrue(rect.left <= ml and rect.top <= mt
+                                and rect.right >= mr and rect.bottom >= mb,
+                                "显示器 %r 没被遮罩盖住" % ((ml, mt, mr, mb),))
+            # 每块屏顶部都要有提示文字，不然双屏时另一块屏上一片黑没说明
+            texts = [i for i in canvas.find_all() if canvas.type(i) == "text"]
+            self.assertEqual(len(texts), max(1, len(self.app._monitors())),
+                             "提示文字数量与显示器数量不一致")
+        finally:
+            top.destroy()
+            self.root.update()
 
     def test_qr_format_offers_sheet_only(self):
         """「只出总览」必须是下拉里的正式选项，不能藏在命令行参数里。"""

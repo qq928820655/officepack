@@ -227,16 +227,36 @@ class GifTest(unittest.TestCase):
             self.assertEqual(fh.read(), self.raw)
 
     def test_gif_is_pixel_lossless(self):
-        """GIF 用 2 色调色板，黑白二维码应逐像素无损（不是"看起来差不多"）。"""
+        """GIF 用 2 色调色板，黑白二维码应逐像素无损（不是"看起来差不多"）。
+
+        首尾各有一张 ``#OPKmark`` 标识帧，比对时剔掉它们 —— 其余数据帧必须
+        与单独渲染的 PNG 逐像素一致。
+        """
         from PIL import Image, ImageSequence
 
         path = qr.render_gif(self.frames, os.path.join(self.tmp, "c.gif"), "L",
                              fps=3, target_px=600)
         with Image.open(path) as im:
             got = [f.convert("L").tobytes() for f in ImageSequence.Iterator(im)]
-        want = [qr._make_qr_image(f, "L", 600).convert("L").tobytes()
-                for f in self.frames]
-        self.assertEqual(got, want)
+        self.assertEqual(len(got), len(self.frames) + 2, "应有首尾两张标识帧")
+        got_data = got[1:-1]
+        want = qr._render_uniform(list(self.frames), "L", 600)
+        want = [im.convert("L").tobytes() for im in want]
+        self.assertEqual(got_data, want)
+
+    def test_gif_frames_share_one_canvas(self):
+        """所有帧必须同尺寸：尺寸不一致时 GIF 会把大的那帧裁掉，播出残缺码。"""
+        from PIL import Image, ImageSequence
+
+        path = qr.render_gif(self.frames, os.path.join(self.tmp, "u.gif"), "L",
+                             fps=3, target_px=620)
+        with Image.open(path) as im:
+            canvas = im.size
+            sizes = [f.size for f in ImageSequence.Iterator(im)]
+        self.assertTrue(sizes)
+        self.assertTrue(all(s == canvas for s in sizes),
+                        "帧尺寸与画布不一致：%r vs %r" % (sizes[:3], canvas))
+        self.assertEqual(len(set(sizes)), 1, "帧尺寸参差不齐：%r" % (set(sizes),))
 
     def test_single_frame_rejects_gif(self):
         pack = ct.pack_bytes(b"tiny", "t.txt", codec_name="qr45", compress="none",

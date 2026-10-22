@@ -247,13 +247,14 @@ def test_qr_preset_and_gif(srcdir: str, samples: dict[str, bytes]) -> str:
             if n.lower().endswith(".png") and "all" not in n.lower()]
     gif_path = os.path.join(outdir, gifs[0])
 
-    # 帧数必须与单帧 PNG 数一致（一帧一张 PNG）
+    # 帧数 = 数据帧（一帧一张 PNG）+ 首尾两张标识帧
     import struct
     with open(gif_path, "rb") as fh:
         raw = fh.read()
     gif_frames = raw.count(b"\x21\xf9\x04")     # 图形控制扩展 = 每帧一个
-    if gif_frames != len(pngs):
-        raise RuntimeError("GIF 帧数 %d ≠ PNG 张数 %d" % (gif_frames, len(pngs)))
+    if gif_frames != len(pngs) + 2:
+        raise RuntimeError("GIF 帧数 %d ≠ 数据帧 %d + 首尾标识 2"
+                           % (gif_frames, len(pngs)))
 
     restored_dir = outdir + "_restored"
     _fresh(restored_dir)

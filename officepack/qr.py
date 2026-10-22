@@ -210,12 +210,103 @@ def _make_qr_image(text: str, ec: str, target_px: int = 960):
     return qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
 
+def _render_uniform(texts: Sequence[str], ec: str, target_px: int):
+    """把一批文本渲染成**同一像素尺寸**的二维码图。
+
+    为什么必须统一：每帧的数据量不同，QR 版本（模块数）就不同，按
+    ``target_px / 模块数`` 反推的模块大小一取整，产出的图片尺寸就参差不齐
+    （实测 555 和 665 混在一起）。GIF 的逻辑画布取的是首帧尺寸，比画布大的帧
+    会被**裁掉右/下边**，播放器里显示的就是个残缺码，怎么扫都扫不出来 ——
+    「框选认不出动图」的根因就在这里。这里统一按最大那帧算模块大小，再把每张
+    居中补白到同一画布，静区照样是白的，不影响识别。
+    """
+    import qrcode
+    from PIL import Image
+
+    counts = []
+    for text in texts:
+        proto = qrcode.QRCode(error_correction=_ec_const(ec), border=4, box_size=1)
+        proto.add_data(text, optimize=20)
+        try:
+            proto.make(fit=True)
+        except Exception as exc:  # 段比这个纠错级别能装的还大
+            raise QRError("二维码内容超出容量（%s）：请降低纠错级别，"
+                          "或调小每帧字符数/改用 qr45 编码" % exc) from None
+        counts.append(proto.modules_count + 8)      # + 两侧各 4 模块静区
+    box = max(3, int(round(target_px / max(counts))))
+
+    images = []
+    for text in texts:
+        qr = qrcode.QRCode(error_correction=_ec_const(ec), border=4, box_size=box)
+        qr.add_data(text, optimize=20)
+        qr.make(fit=True)
+        images.append(qr.make_image(fill_color="black", back_color="white").convert("RGB"))
+
+    side = max(im.width for im in images)
+    side = max([side] + [im.height for im in images])
+    out = []
+    for im in images:
+        if im.size != (side, side):
+            canvas = Image.new("RGB", (side, side), "white")
+            canvas.paste(im, ((side - im.width) // 2, (side - im.height) // 2))
+            im = canvas
+        out.append(im)
+    return out
+
+
+#: 动图的首/尾标识帧前缀。有它，识别端才知道「从哪开始、到哪算一轮收完」，
+#: 而不是靠猜播放相位；没有它的旧 GIF 仍然按原来的方式收（向后兼容）。
+MARKER_PREFIX = "#OPKmark"
+
+
+def marker_text(kind: str, doc_id: str, total: int | None = None) -> str:
+    """生成标识帧文本：``#OPKmark|S|<docId>|<总帧数>`` / ``#OPKmark|E|<docId>``。"""
+    if kind.upper() == "S":
+        return "%s|S|%s|%d" % (MARKER_PREFIX, doc_id, int(total or 0))
+    return "%s|E|%s" % (MARKER_PREFIX, doc_id)
+
+
+def is_marker(text: str) -> bool:
+    return bool(text) and text.startswith(MARKER_PREFIX)
+
+
+def parse_marker(text: str):
+    """解析标识帧，返回 ``(kind, doc_id, total)``；不是标识返回 None。"""
+    if not is_marker(text):
+        return None
+    parts = text.split("|")
+    if len(parts) < 3:
+        return None
+    kind = parts[1].strip().upper()
+    doc_id = parts[2].strip()
+    total = None
+    if len(parts) > 3:
+        try:
+            total = int(parts[3])
+        except ValueError:
+            total = None
+    return kind, doc_id, total
+
+
+def _mark_texts(frames: Sequence[str]) -> tuple[str, str] | None:
+    """按分段的 doc_id / 总帧数生成首尾标识；非分段内容（单码容器）不加。"""
+    try:
+        segs = ct.parse_segments("\n".join(frames))
+    except Exception:  # noqa: BLE001
+        return None
+    if not segs:
+        return None
+    seg = segs[0]
+    return marker_text("S", seg.doc_id, seg.total), marker_text("E", seg.doc_id)
+
+
 def render_gif(
     frames: Sequence[str],
     out_path: str,
     ec: str = DEFAULT_EC,
     fps: float = 3.0,
     target_px: int = 720,
+    markers: bool = True,
 ) -> str:
     """把多帧合成一张**循环播放的 GIF**：手机对着屏幕录像/扫码就能一次收全。
 
@@ -224,6 +315,10 @@ def render_gif(
     真正省体积靠的是 ``target_px``（每模块 3px 就够扫，无需 5px）。
 
     帧率别贪高：手机相机对焦+解码要 150ms 以上，``fps`` 取 2~4 最稳。
+
+    ``markers=True`` 会在首尾各插一张**标识帧**（``#OPKmark|S`` / ``|E``）：
+    屏幕框选时画面是动的，识别端不可能知道一轮从哪开始、到哪结束 —— 有了标识帧，
+    它就是「见首帧清零、逐帧收、见尾帧收工」，漏帧还能靠下一轮补齐。
     """
     from PIL import Image
 
@@ -234,8 +329,16 @@ def render_gif(
     fps = max(0.5, min(10.0, float(fps)))
     duration = int(round(1000.0 / fps))
 
-    images = [_make_qr_image(f, ec, target_px).convert("P", palette=Image.ADAPTIVE, colors=2)
-              for f in frames]
+    texts = list(frames)
+    marks = _mark_texts(frames) if markers else None
+    if marks:
+        # 首帧 S 在前、尾帧 E 在后：识别端见 S 开始收，见 E 收工
+        texts = [marks[0]] + texts + [marks[1]]
+
+    from PIL import Image
+
+    images = [im.convert("P", palette=Image.ADAPTIVE, colors=2)
+              for im in _render_uniform(texts, ec, target_px)]
     images[0].save(
         out_path, "GIF", save_all=True, append_images=images[1:],
         duration=duration, loop=0, optimize=True, disposal=2,
@@ -389,7 +492,8 @@ def unpack_any(
     return results, {"images": len(images), "texts": len(texts), "blocks": len(blocks)}
 
 
-def decode_image(image, deep: bool = True) -> list[str]:
+def decode_image(image, deep: bool = True, fast: bool = False,
+                 keep_markers: bool = False) -> list[str]:
     """识别单张图里的所有二维码；可传路径、PIL 图或 numpy 数组。
 
     多帧图（GIF / 动图 PNG / TIFF）会**逐帧**识别 —— 所以一段动态二维码
@@ -397,27 +501,41 @@ def decode_image(image, deep: bool = True) -> list[str]:
 
     ``deep=False`` 是「一批图里的其中一张」：每张只给 1.5 秒、不做昂贵重试，
     避免一次多选十几张图等上几分钟。
+
+    ``fast=True`` 只跑一遍原图，一个像素变换都不试（毫秒级）——
+    给「对着动图连续抓帧」用，抓得快才能追上播放速度。
+
+    ``keep_markers`` 只在现场连拍时用：需要拿到 ``#OPKmark`` 首尾标识帧判断
+    一轮动图从哪开始、到哪结束；还原时必须丢掉它们，那是控制信号不是数据。
     """
     import zxingcpp
     from PIL import Image, ImageSequence
 
     if isinstance(image, str):
         with Image.open(image) as img:      # 一定要 close：动图会占着文件句柄
-            return _decode_frames(img, deep)
+            return _decode_frames(img, deep, fast, keep_markers)
     if not hasattr(image, "mode"):        # numpy 数组之类，交给 zxing 自己处理
         results = zxingcpp.read_barcodes(image)
         return [r.text for r in results if r.text]
-    return _decode_frames(image, deep)
+    return _decode_frames(image, deep, fast, keep_markers)
 
 
-def _decode_frames(img, deep: bool = True) -> list[str]:
+def _decode_frames(img, deep: bool = True, fast: bool = False,
+                   keep_markers: bool = False) -> list[str]:
     """逐帧识别一张图（静态图就是走一帧）。"""
     from PIL import ImageSequence
 
     texts: list[str] = []
+    seen: set[str] = set()
     for frame in ImageSequence.Iterator(img):
-        texts.extend(_read_one(frame, deep))
-    return _dedup(texts)
+        for text in _read_one(frame, deep, fast):
+            if text in seen:
+                continue
+            if not keep_markers and is_marker(text):
+                continue
+            seen.add(text)
+            texts.append(text)
+    return texts
 
 
 def _dedup(items: list[str]) -> list[str]:
@@ -442,7 +560,7 @@ BATCH_BUDGET = 1.5
 UPSCALE_LIMIT = 6_000_000
 
 
-def _read_one(img, deep: bool = True) -> list[str]:
+def _read_one(img, deep: bool = True, fast: bool = False, budget: float | None = None) -> list[str]:
     """识别一张（单帧）图里的所有码；识别不全就逐级加码重试。
 
     屏幕截图里常有水印、半透明蒙层、看图软件的缩放插值，一次 zxing 掉帧很正常。
@@ -472,10 +590,14 @@ def _read_one(img, deep: bool = True) -> list[str]:
         texts = [r.text for r in zxingcpp.read_barcodes(img) if r.text]
     except Exception as exc:  # 损坏图片 / 不支持的格式
         raise QRError("二维码识别失败：%s" % exc) from None
+    if fast:                      # 连拍模式：只认原图，交给调用方下一枪再试
+        return _dedup(texts)
     if texts and _looks_complete(texts):
         return _dedup(texts)
 
-    deadline = time.monotonic() + (RETRY_BUDGET if deep else BATCH_BUDGET)
+    if budget is None:
+        budget = RETRY_BUDGET if deep else BATCH_BUDGET
+    deadline = time.monotonic() + budget
     seen = set(texts)
     baseline = len(texts)
 
@@ -544,6 +666,142 @@ def _looks_complete(texts: list[str]) -> bool:
         need[seg.doc_id] = seg.total
         got.setdefault(seg.doc_id, set()).add(seg.index)
     return all(len(got[d]) >= need[d] for d in need)
+
+
+#: 连拍参数：两枪间隔 / 多久没新帧就收工 / 最长连拍多久 / 空手多久就转入全力重试
+SCAN_INTERVAL = 0.05
+SCAN_IDLE = 3.0
+SCAN_CAP = 30.0
+SCAN_EMPTY_SHOTS = 6
+#: 连拍结束后对最后一张图做全力重试的预算
+SCAN_DEEP_BUDGET = 4.0
+
+
+def _frame_key(img) -> bytes | None:
+    """画面指纹：屏幕没变就不必重新解码，把时间省给下一帧。"""
+    import hashlib
+
+    try:
+        return hashlib.blake2b(img.tobytes(), digest_size=16).digest()
+    except Exception:  # noqa: BLE001  取不到就不去重
+        return None
+
+
+def scan_region(grab, idle: float | None = None, cap: float | None = None,
+                interval: float | None = None, on_progress=None,
+                should_stop=None) -> tuple[list[str], dict]:
+    """对着同一块屏幕区域连续抓图，把动图里一帧帧的码全收下来。
+
+    框选的真正用途就是动图：**一张截图只能拿到播放中的某一帧**，而一段动态
+    二维码有十几帧，靠单次截图必然缺帧、必然还原失败。
+
+    播放相位不可知，所以有两种收工方式：
+
+    * **有首尾标识帧**（``render_gif`` 默认插入）：见 ``#OPKmark|S`` 记一轮开始，
+      见 ``|E`` 记一轮结束，收齐即停；某轮漏了帧就自动再等下一轮，连续两轮
+      一帧新东西都没收到才放弃。
+    * **没有标识**（旧动图 / 别人的图）：连续 ``idle`` 秒没有新帧就收工。
+
+    ``grab()`` 由调用方提供（返回 PIL.Image），本模块不碰屏幕，便于测试。
+
+    返回 ``(texts, stats)``，texts 不含标识帧；stats 含
+    ``shots / frames / cycles / complete / elapsed``。
+    """
+    import time
+
+    idle = SCAN_IDLE if idle is None else idle
+    cap = SCAN_CAP if cap is None else cap
+    interval = SCAN_INTERVAL if interval is None else interval
+
+    started = time.monotonic()
+    last_new = started
+    texts: list[str] = []
+    seen: set[str] = set()
+    shots = 0
+    complete = False
+    last_img = None
+    last_key = None
+    starts = 0            # 见到首帧的次数 = 已经完整播了几轮
+    progress_cycle = 0    # 最近一次收到新帧时的轮次
+    saw_end = False
+    marked = False
+
+    while True:
+        now = time.monotonic()
+        if (now - started) >= cap:
+            break
+        if marked:
+            # 有标识帧：按轮次算，连续两轮颗粒无收才放弃（期间画面继续播）
+            if saw_end and starts - progress_cycle >= 2:
+                break
+            # 尾帧一直没被认出来（播放卡住/码太糊），别死等到 cap
+            if not saw_end and (now - last_new) >= idle * 2:
+                break
+        elif (now - last_new) >= idle:
+            break
+        # 连开几枪一张码都没见着：多半框错了地方，赶紧转全力重试，别干等
+        if not texts and shots >= SCAN_EMPTY_SHOTS:
+            break
+        if should_stop is not None and should_stop():
+            break
+        try:
+            img = grab()
+        except Exception:  # noqa: BLE001  切桌面/锁屏导致的偶发抓图失败不该中断
+            img = None
+        shots += 1
+        if img is not None:
+            key = _frame_key(img)
+            if key is None or key != last_key:      # 画面变了才解码
+                last_key = key
+                last_img = img
+                try:
+                    found = decode_image(img, fast=True, keep_markers=True)
+                except Exception:  # noqa: BLE001
+                    found = []
+                data: list[str] = []
+                for text in found:
+                    mk = parse_marker(text)
+                    if mk is None:
+                        data.append(text)
+                        continue
+                    marked = True
+                    if mk[0] == "S":
+                        starts += 1
+                    elif mk[0] == "E":
+                        saw_end = True
+                fresh = [t for t in data if t not in seen]
+                if fresh:
+                    seen.update(fresh)
+                    texts.extend(fresh)
+                    last_new = time.monotonic()
+                    if starts:
+                        progress_cycle = starts
+                if texts and _looks_complete(texts):
+                    complete = True
+                    break
+        if on_progress is not None:
+            try:
+                on_progress({"shots": shots, "frames": len(texts), "cycles": starts,
+                             "elapsed": time.monotonic() - started,
+                             "complete": complete})
+            except Exception:  # noqa: BLE001  回调出错不能拖垮识别
+                pass
+        time.sleep(interval)
+
+    # 便宜的连拍认不出来（码小、有水印、压缩噪点），拿最后一张图做一次全力重试
+    if last_img is not None and not complete:
+        try:
+            deep = _read_one(last_img, budget=SCAN_DEEP_BUDGET)
+        except Exception:  # noqa: BLE001
+            deep = []
+        fresh = [t for t in deep if t not in seen and not is_marker(t)]
+        if fresh:
+            seen.update(fresh)
+            texts.extend(fresh)
+            complete = _looks_complete(texts)
+
+    return texts, {"shots": shots, "frames": len(texts), "cycles": starts,
+                   "complete": complete, "elapsed": time.monotonic() - started}
 
 
 def _otsu(img):

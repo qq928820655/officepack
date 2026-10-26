@@ -442,6 +442,92 @@ def test_icons_bundled():
     return "ico + %d 张 png" % len(pngs)
 
 
+def _ico_sizes(path: str) -> set:
+    """读 .ico 目录，返回 {(宽, 高)}。宽高字节为 0 表示 256。"""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if len(data) < 6 or data[2:4] != b"\x01\x00":
+        raise RuntimeError("%s 不是合法 ico" % path)
+    count = data[4] | (data[5] << 8)
+    out = set()
+    for i in range(count):
+        off = 6 + i * 16
+        if off + 16 > len(data):
+            break
+        w, h = data[off], data[off + 1]
+        out.add((w or 256, h or 256))
+    return out
+
+
+def _exe_icon_sizes(path: str) -> set:
+    """读 exe 的 RT_GROUP_ICON，返回 {(宽, 高)}。没有资源返回空集合。"""
+    import pefile
+    import struct
+
+    pe = pefile.PE(path, fast_load=True)
+    pe.parse_data_directories(
+        directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
+    sizes = set()
+    root = getattr(pe, "DIRECTORY_ENTRY_RESOURCE", None)
+    if root is not None:
+        for entry in root.entries:
+            if entry.id != 14:                     # RT_GROUP_ICON
+                continue
+            for sub in entry.directory.entries:
+                for lang in sub.directory.entries:
+                    data = lang.data.struct
+                    blob = pe.get_data(data.OffsetToData, data.Size)
+                    if len(blob) < 6:
+                        continue
+                    count = struct.unpack_from("<H", blob, 4)[0]
+                    for i in range(count):
+                        off = 6 + i * 14
+                        if off + 14 > len(blob):
+                            break
+                        w, h = blob[off], blob[off + 1]
+                        sizes.add((w or 256, h or 256))
+    pe.close()
+    return sizes
+
+
+def test_exe_shell_icon():
+    """exe **自身**的图标资源（资源管理器里显示的那个），不是包里的 assets。
+
+    和 test_icons_bundled 是两回事：那个查的是 assets/officepack.ico 有没有
+    被打进包（窗口/任务栏图标用），这个查 exe 的 RT_GROUP_ICON（文件图标用）。
+    1.4.11 之前 CLI 那条构建命令从来没带 --icon，officepack.exe 一直是
+    PyInstaller 默认图标，而旧校验只查 assets，所以一直没被发现。
+    """
+    ico = os.path.join(ROOT, "assets", "officepack.ico")
+    if not os.path.isfile(ico):
+        raise RuntimeError("源码里没有 assets/officepack.ico")
+    want = _ico_sizes(ico)
+    targets = [GUI, CLI]
+    single = os.path.join(DIST, "OfficePack-GUI-便携单文件（启动慢）.exe")
+    if os.path.isfile(single):
+        targets.append(single)
+
+    detail = []
+    problems = []
+    for path in targets:
+        if not os.path.isfile(path):
+            continue
+        got = _exe_icon_sizes(path)
+        name = os.path.basename(path)
+        if not got:
+            problems.append("%s 没有任何图标资源" % name)
+        elif got != want:
+            missing = sorted(want - got)
+            problems.append("%s 图标尺寸不全（缺 %s）" % (name, missing))
+        else:
+            detail.append("%s %d 张" % (name, len(got)))
+    if problems:
+        raise RuntimeError("；".join(problems) + "（检查构建命令是否带 --icon）")
+    if not detail:
+        raise RuntimeError("没找到任何 exe")
+    return "、".join(detail)
+
+
 def main() -> int:
     print("=" * 78)
     print("  officepack 发布前功能验证")
@@ -481,6 +567,7 @@ def main() -> int:
     print("\n[8] 瘦身完整性")
     check("精简后功能仍然正常", test_trimmed_bundle_intact)
     check("图标资源已打进包", test_icons_bundled)
+    check("exe 自身图标（资源管理器显示的那个）", test_exe_shell_icon)
 
     if "--no-gui" not in sys.argv:
         print("\n[9] 图形界面")

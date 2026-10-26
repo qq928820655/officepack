@@ -82,6 +82,46 @@
 
 中止后日志末尾会冒出一行旧进度（`渲染 PNG 12%（19/152）`），看着像中止没生效。原因是主线程一次轮询里读到 `done` 就收尾了，但循环末尾还会把同一批里读到的最后一条进度再刷一帧。现在收尾时把积压的进度消息直接作废。
 
+## 六、为什么「exe 图标看起来还是 Python 的」
+
+这一条单独立项，因为它被反复问了两轮，而真相跟打包无关。
+
+**先说结论：exe 里的图标一直是对的。** 从 `OfficePack-GUI.exe` 的
+`RT_GROUP_ICON` 资源里直接抽出来是这样：
+
+| 尺寸 | 内容 |
+|---|---|
+| 256×256 | 蓝色圆角底 + 文档 + 二维码 |
+| 16×16（列表视图用这张） | 同一图标的简化版，四个二维码角标 |
+
+资源表里只有**一组** `RT_GROUP_ICON`（ID=1，8 张：256/128/64/48/40/32/24/16），
+没有第二组默认图标来抢位置 —— 我专门查过这一点，因为 Windows 只认 ID 最小的那组。
+
+**那你为什么会看到 Python 图标**：资源管理器把「路径 → 图标」缓存在
+`%LocalAppData%\Microsoft\Windows\Explorer\iconcache_*.db` 里，而我们每次发布都是
+**同名同路径覆盖** `OfficePack-GUI.exe`。缓存经常不认账，于是文件图标还是上一版的，
+但双击启动后窗口/任务栏图标是程序运行时从 `assets/*.png` 现读的 —— 所以「文件图标是
+Python、程序图标是我们的」这个割裂现象，恰恰是缓存的特征。
+
+**三种刷新办法**（新加的 `scripts/refresh_icon_cache.py` 就是干这个的）：
+
+```bat
+python scripts/refresh_icon_cache.py            REM 轻量：ie4uinit -show
+python scripts/refresh_icon_cache.py --hard     REM 彻底：删 iconcache + 重启 explorer（桌面会闪）
+python scripts/refresh_icon_cache.py --copy     REM 换文件名，立刻生效，不动系统
+```
+
+**顺带抓到真问题**：`build_exe.cmd` 里命令行那条构建命令**从来没有 `--icon`**，
+所以 `officepack.exe` 一直是 PyInstaller 的默认图标（资源 7 张、48/32/16 重复两轮）。
+之前 `verify_release.py` 只查「assets 有没有打进包」（那是窗口图标用的），查不到这个。
+
+现在两件事都补上了：
+
+- CLI 和单文件 CLI 的构建命令都加了 `--icon ../assets/officepack.ico`，重建后 8 张，
+  尺寸与 `assets/officepack.ico` 完全一致；
+- `verify_release.py` 新增第 11 项 **「exe 自身图标（资源管理器显示的那个）」** ——
+  直接读 `RT_GROUP_ICON`，尺寸集合与源 ico 不一致就判失败。以后漏一个都要红。
+
 ---
 
 ## 验收

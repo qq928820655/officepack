@@ -381,6 +381,11 @@ class App:
         self._scan_phase = 0.0                 # 下一轮采样相位（0~1 个采样周期，见 qr.plan_jitter）
         self._scan_plan = None                  # 上一轮算出的抖动/提速建议（见 qr.plan_jitter）
         self._scan_cancelled = False
+        # 打包/还原的「中止」信号。以前只有框选扫描能中止，出码和还原一旦开跑
+        # 就只能等 —— 957 帧的动图要跑一分钟，中途发现选错格式根本停不下来。
+        # 用 Event 而不是 bool：工作线程只读，主线程置位，不需要加锁。
+        self._cancel = threading.Event()
+        self._run_t0 = 0.0                     # 本轮开始时刻（算「本次总用时」）
         self._scan_active = False              # 扫描进行中：主窗口保持最小化
         self._last_phys = None                 # 上次框选的物理坐标：再来一轮不用重框
         self._scan_bbox = None                 # 本次扫描区域（物理像素）
@@ -499,6 +504,8 @@ class App:
         ttk.Button(btns, text="添加文件", command=self.add_files).pack(side="left")
         ttk.Button(btns, text="移除选中", command=self.remove_selected).pack(side="left", padx=6)
         ttk.Button(btns, text="清空", command=self.clear_files).pack(side="left")
+        # 历史残留清理：扫过的诊断抓图、中止/强退留下的半成品记录都堆在 %TEMP%
+        ttk.Button(btns, text="清理临时文件", command=self.clean_temp).pack(side="right")
 
         if self.has_dnd:
             try:
@@ -654,8 +661,16 @@ class App:
         ttk.Radiobutton(webp_row, text="体积", value="体积优先",
                         variable=self.webp_mode).pack(side="left", padx=(8, 0))
 
-        self.go = ttk.Button(right, text="开始处理", style="Go.TButton", command=self.start)
-        self.go.grid(row=10, column=0, sticky="ew", padx=10, pady=(12, 3))
+        # 开始 / 中止同一行：开跑之后「开始」变灰，右边这个才亮 ——
+        # 用户不用去别处找停止入口，视线就在原地。
+        go_row = ttk.Frame(right)
+        go_row.grid(row=10, column=0, sticky="ew", padx=10, pady=(12, 3))
+        go_row.columnconfigure(0, weight=1)
+        self.go = ttk.Button(go_row, text="开始处理", style="Go.TButton", command=self.start)
+        self.go.grid(row=0, column=0, sticky="ew")
+        self.stop_btn = ttk.Button(go_row, text="中止", width=6,
+                                   command=self.cancel_run, state="disabled")
+        self.stop_btn.grid(row=0, column=1, padx=(6, 0))
 
         self.open_btn = ttk.Button(right, text="打开输出文件夹", command=self.open_out_dir)
         self.open_btn.grid(row=11, column=0, sticky="ew", padx=10, pady=(0, 3))
@@ -2884,6 +2899,51 @@ class App:
                 else "%s %d%% (%d/%d)" % (self._short_phase(phase), pct, done, total))
         self._set_bar_text("%s · %.0fs" % (head, elapsed))
 
+    def cancel_run(self):
+        """点「中止」：给工作线程发信号，各阶段在帧边界抛 ``qr.Cancelled``。
+
+        为什么要每个阶段都设检查点：出码链路里最长的是 zxing 预排（3825 帧
+        约一分钟）和 WebP 逐帧编码，只在入口判一次等于没判 —— 用户点了中止
+        还得干等一分钟，感受和「按钮没反应」一样。
+        """
+        if not (self.worker and self.worker.is_alive()):
+            return
+        self._cancel.set()
+        try:
+            self.stop_btn.configure(state="disabled", text="正在中止…")
+        except tk.TclError:
+            pass
+        self._log("· 收到中止请求 —— 把手上这一帧收尾就停，"
+                  "随后清掉本次的中间文件")
+
+    def clean_temp(self, silent: bool = False) -> tuple[int, int]:
+        """清掉本程序留在 %TEMP% 里的中间文件。
+
+        「中间文件」到底是些什么：框选识别失败时存下的诊断抓图
+        （``officepack_框选抓图_*.png``，一张约 200KB）。它们只在排查
+        「为什么扫不出」时有用，问题解决了就是纯垃圾 —— 攒几十次能到上百兆。
+
+        为什么要用户主动点一次：程序被强杀（任务管理器结束进程、断电）时，
+        收尾代码根本没机会跑，这些图就永久留在临时目录里。给一个按钮，
+        用户才能把历史残留一次清干净。
+
+        返回（删了几个, 释放多少字节）。
+        """
+        removed, freed = clean_scan_shots(None)
+        if not silent:
+            if removed:
+                self._log("🧹 已清理 %d 个历史中间文件，释放 %s"
+                          % (removed, _human(freed)))
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "已清理 %d 个中间文件，释放 %s。\n\n"
+                    "（都是框选识别的诊断抓图，删掉不影响任何已完成的结果）"
+                    % (removed, _human(freed)))
+            else:
+                self._log("🧹 临时目录里没有本程序留下的中间文件")
+                messagebox.showinfo(APP_TITLE, "临时目录很干净，没有需要清理的文件。")
+        return removed, freed
+
     def start(self):
         if self.worker and self.worker.is_alive():
             return
@@ -2907,6 +2967,12 @@ class App:
                        else ct.DEFAULT_SEGMENT_CHARS)
 
         self.go.configure(state="disabled", text="处理中…")
+        self._cancel.clear()
+        self._run_t0 = time.monotonic()
+        try:
+            self.stop_btn.configure(state="normal", text="中止")
+        except tk.TclError:
+            pass
         self._file_pos = (0, len(self.files))
         self._start_bar()
         self._log("── 开始%s，共 %d 个文件 ──" % ("打包" if mode == "pack" else "还原", len(self.files)))
@@ -2927,15 +2993,21 @@ class App:
     def _run(self, mode, files, out_dir, password, cipher, codec_name, compress_mode,
              segment, as_qr=False, qr_format="PNG（单帧 + 总览）", qr_fps="3",
              webp_mode="速度优先", matrix=1):
+        t0 = time.monotonic()
         ok = 0
         outputs: list[str] = []
         errors: list[str] = []
+        cancelled = False
+        # 传给 qr 各阶段的取消回调。``Event.is_set`` 是 C 实现，每帧查一次
+        # 约 0.2µs，相对单帧 10ms 的渲染开销可以忽略。
+        stop = self._cancel.is_set
 
         if mode == "unpack":
             # 分段必须整体合并还原，不能逐个文件处理；图片和文本混着给也能一起还原
             try:
                 results, stats = qr.unpack_any(files, out_dir, password,
-                                               progress=self._qr_progress())
+                                               progress=self._qr_progress(),
+                                               should_stop=stop)
                 self.queue.put(("bar", (1, 1, "识别完成")))
                 if stats["images"]:
                     self.queue.put(("log",
@@ -2948,26 +3020,40 @@ class App:
                     self.queue.put(("log",
                         "✅ 还原 → %s\n   %d 字节，SHA-256 校验通过 %s…" % (
                             path, meta["size"], meta["sha256"][:16])))
+            except qr.Cancelled:
+                cancelled = True
+                self.queue.put(("log", "· 已中止还原 —— 还没走到写盘，"
+                                       "输出目录里不会留下半个文件"))
             except Exception as exc:
                 errors.append("还原失败：%s" % exc)
                 self.queue.put(("log", "✗ 还原失败：%s" % exc))
             self.queue.put(("tick", len(files)))
             self.queue.put(("done", {"ok": ok, "fail": len(files) - ok,
-                                     "outputs": outputs, "errors": errors}))
+                                     "outputs": outputs, "errors": errors,
+                                     "cancelled": cancelled,
+                                     "elapsed": time.monotonic() - t0}))
             return
 
         for src in files:
+            if self._cancel.is_set():
+                cancelled = True
+                self.queue.put(("log", "· 已中止，剩下 %d 个文件没有处理"
+                                % (len(files) - ok - len(errors))))
+                break
             name = os.path.basename(src)
+            t_file = time.monotonic()
             # 归零要碰 Tk 控件，必须回主线程做（工作线程直接 configure 会抛
             # "main thread is not in main loop"）
             self.queue.put(("call", self._start_bar))
             try:
                 if as_qr:
-                    paths = self._pack_one_qr(src, name, out_dir, password, cipher,
-                                              compress_mode, codec_name, outputs,
-                                              qr_format, qr_fps, webp_mode,
-                                              matrix=matrix)
+                    self._pack_one_qr(src, name, out_dir, password, cipher,
+                                      compress_mode, codec_name, outputs,
+                                      qr_format, qr_fps, webp_mode,
+                                      matrix=matrix, should_stop=stop)
                     ok += 1
+                    self.queue.put(("log", "   本文件用时 %.1f 秒"
+                                    % (time.monotonic() - t_file)))
                     continue
 
                 out_path = None
@@ -2994,12 +3080,35 @@ class App:
                         (meta.get("cipher") or {}).get("alg", "none"), seg_note,
                         paths[0] if len(paths) == 1
                         else "%s … %s" % (paths[0], os.path.basename(paths[-1])))))
+            except qr.Cancelled as exc:
+                cancelled = True
+                # 中止前已经落盘的图要算进「已写出」：逐张写 PNG 时异常是从
+                # 写盘循环里抛的，光看返回值会误报「没有写出任何文件」
+                for path in exc.partial:
+                    if path not in outputs:
+                        outputs.append(path)
+                if exc.partial:
+                    self.queue.put(("log",
+                        "· 已中止（%s 没做完）—— 已写出的 %d 个文件保留在原处，"
+                        "剩下的不会再动" % (name, len(exc.partial))))
+                else:
+                    self.queue.put(("log",
+                        "· 已中止（%s 没做完）—— 这次还没写出文件"
+                        % name))
+                break
             except Exception as exc:
                 errors.append("%s：%s" % (name, exc))
                 self.queue.put(("log", "✗ %s：%s" % (name, exc)))
+            else:
+                self.queue.put(("log", "   本文件用时 %.2f 秒"
+                                % (time.monotonic() - t_file)))
             self.queue.put(("tick", 1))
-        self.queue.put(("done", {"ok": ok, "fail": len(files) - ok,
-                                 "outputs": outputs, "errors": errors}))
+        self.queue.put(("done", {"ok": ok,
+                                 # 中止时没轮到的文件不算失败，别在总结里吓人
+                                 "fail": 0 if cancelled else len(files) - ok,
+                                 "outputs": outputs, "errors": errors,
+                                 "cancelled": cancelled,
+                                 "elapsed": time.monotonic() - t0}))
 
     def _pack_progress(self):
         """打包流水线（压缩 → 加密 → 编码）的进度回调。
@@ -3104,7 +3213,7 @@ class App:
 
     def _pack_one_qr(self, src, name, out_dir, password, cipher, compress_mode,
                      codec_name, outputs, qr_format="PNG（单帧 + 总览）", qr_fps="3",
-                     webp_mode="速度优先", matrix=1):
+                     webp_mode="速度优先", matrix=1, should_stop=None):
         """单个文件走二维码通道；返回写出的图片路径。编码器沿用界面选择。"""
         with open(src, "rb") as fh:
             raw = fh.read()
@@ -3131,6 +3240,9 @@ class App:
         self.queue.put(("log", "   打包 %.1f 秒：%s → %s → %d 字符"
                         % (pack_sec, _human(len(raw)), _human(len(pack.payload)),
                            len(pack.encoded or ""))))
+        # 打包（压缩→加密→编码）几百毫秒到几十秒不等，提前中止就别往下出码了：
+        # 这时候一张图都还没写，停在这里是「零副作用」的
+        qr._check_stop(should_stop)
         frames = qr.build_frames(pack, ec=qr.DEFAULT_EC)
         if matrix > 1 and len(frames) > 1:
             # 矩阵不是越多越好：帧数降到 1/N²，但每张码在屏幕上只剩 1/N 宽。
@@ -3154,7 +3266,8 @@ class App:
         if want_png:
             res = qr.render_images(frames, target_dir, name, ec=qr.DEFAULT_EC,
                                    sheet=True, single=want_single,
-                                   progress=self._qr_progress("渲染 PNG"))
+                                   progress=self._qr_progress("渲染 PNG"),
+                                   should_stop=should_stop)
             outputs.extend(res["images"])
             outputs.extend(res.get("sheets") or [])
 
@@ -3199,20 +3312,22 @@ class App:
                 # 只能全量留住（内存换时间，用户明确要两份才走这里）
                 anim_imgs = list(qr.anim_images(frames, qr.DEFAULT_EC, 720, True,
                                                 self._qr_progress("渲染矩阵"),
-                                                matrix=matrix))
+                                                matrix=matrix,
+                                                should_stop=should_stop))
             # 只出一种时**不预渲染列表**：交给 qr 那边流式出帧 + 编码，
             # 3800 帧全铺在内存里会直接卡死（实测「写入 77% 之后再不动」）
         elif want_gif and want_webp:
             self.queue.put(("log", "   GIF 和 WebP 要出两份：帧只渲染一遍，两边共用"))
             anim_imgs = list(qr._anim_source(frames, qr.DEFAULT_EC, 720, True,
-                                             self._qr_progress("渲染动图")))
+                                             self._qr_progress("渲染动图"),
+                                             should_stop=should_stop))
 
         gif_path = None
         if want_gif:
             gif_path = os.path.join(target_dir, "%s.qr.gif" % name)
             qr.render_gif(frames, gif_path, ec=qr.DEFAULT_EC, fps=fps,
                           progress=self._qr_progress("合成动图"), images=anim_imgs,
-                          matrix=matrix)
+                          matrix=matrix, should_stop=should_stop)
             outputs.append(gif_path)
 
         webp_path = None
@@ -3225,7 +3340,7 @@ class App:
                 t_webp = time.monotonic()
                 qr.render_webp(frames, webp_path, ec=qr.DEFAULT_EC, fps=fps,
                                progress=self._qr_progress("合成 WebP"), images=anim_imgs,
-                               method=method, matrix=matrix)
+                               method=method, matrix=matrix, should_stop=should_stop)
                 spent = time.monotonic() - t_webp
                 # 记住实测速度：下次写动图就能把「大约还要 xx 秒」算准
                 self._webp_rate = spent / max(1, anim_n)
@@ -3278,8 +3393,17 @@ class App:
         """一轮处理结束：日志汇总 + 明确的弹窗提示 + 输出位置。"""
         ok, fail = info["ok"], info["fail"]
         outputs, errors = info["outputs"], info["errors"]
+        cancelled = bool(info.get("cancelled"))
+        elapsed = float(info.get("elapsed") or 0.0)
+        spent = _fmt_spent(elapsed)
 
         self.go.configure(state="normal", text="开始处理")
+        try:
+            self.stop_btn.configure(state="disabled", text="中止")
+        except tk.TclError:
+            pass
+        self._cancel.clear()
+        self._run_t0 = 0.0
         self._file_pos = (0, 0)
         self._bar_t0 = 0.0
         try:
@@ -3289,7 +3413,11 @@ class App:
         except tk.TclError:
             pass
         self._show_bars(False)         # 收工：进度条收起来（占位高度不变）
-        self._log("── 完成：成功 %d / 失败 %d ──" % (ok, fail))
+        if cancelled:
+            self._log("── 已中止：完成 %d 个 · 本次用时 %s ──" % (ok, spent))
+        else:
+            self._log("── 完成：成功 %d / 失败 %d · 本次用时 %s ──"
+                      % (ok, fail, spent))
 
         if outputs:
             self.last_out_dir = os.path.dirname(outputs[0])
@@ -3302,23 +3430,47 @@ class App:
         else:
             self.last_out_dir = self.out_dir.get().strip() or None
 
+        if cancelled:
+            # 中止后的收尾：把本次与历史留下的中间文件清掉（抓图每张约 200KB）。
+            # 已写出的输出**不删** —— 那是用户能直接用的东西，删了才是损失。
+            removed, freed = self.clean_temp(silent=True)
+            if removed:
+                self._log("· 中间文件已清理：%d 个，释放 %s"
+                          % (removed, _human(freed)))
+            else:
+                self._log("· 没有需要清理的中间文件")
+            if outputs:
+                ask = ("已中止。\n\n本次用时 %s，已写出 %d 个文件（保留在原处）。\n\n"
+                       "中间文件已清理：%d 个 / %s\n\n是否打开输出文件夹？"
+                       % (spent, len(outputs), removed, _human(freed)))
+                if messagebox.askyesno(APP_TITLE, ask):
+                    self.open_out_dir()
+            else:
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "已中止。\n\n本次用时 %s，没有写出任何文件。\n"
+                    "中间文件已清理：%d 个 / %s" % (spent, removed, _human(freed)))
+            return
+
         if fail:
             detail = "\n".join(errors[:8]) or "未知原因"
             if len(errors) > 8:
                 detail += "\n…"
             messagebox.showerror(
                 APP_TITLE,
-                "处理结束：成功 %d 个，失败 %d 个\n\n失败原因：\n%s"
-                % (ok, fail, detail),
+                "处理结束：成功 %d 个，失败 %d 个\n本次用时 %s\n\n失败原因：\n%s"
+                % (ok, fail, spent, detail),
             )
             return
 
         if not outputs:
-            messagebox.showwarning(APP_TITLE, "没有生成任何文件，请检查输入。")
+            messagebox.showwarning(
+                APP_TITLE, "没有生成任何文件，请检查输入。\n\n本次用时 %s" % spent)
             return
 
         where = self.last_out_dir or "(原文件所在目录)"
-        ask = "处理完成：成功 %d 个文件。\n\n输出位置：\n%s\n" % (ok, where)
+        ask = ("处理完成：成功 %d 个文件。\n\n本次用时：%s\n\n输出位置：\n%s\n"
+               % (ok, spent, where))
         if len(outputs) > 1:
             ask += "（共 %d 个文件）\n" % len(outputs)
         ask += "\n是否打开该文件夹？"
@@ -3338,6 +3490,10 @@ class App:
                 elif kind == "bar":
                     bars = payload      # 积压时只认最后一条，免得主线程被刷爆
                 elif kind == "done":
+                    # 收工时把本轮积压的进度消息作废：否则 _finish 打印完
+                    # 「── 已中止 ──」之后，循环末尾还会用它再刷一帧
+                    # 「渲染 PNG 12%（19/152）」，看着像中止没生效
+                    bars = None
                     self._finish(payload)
                 elif kind == "hud":
                     try:
@@ -3394,6 +3550,23 @@ def _cursor_pos():
     except Exception:  # noqa: BLE001  非 Windows / 调用失败就走回退路径
         pass
     return None
+
+
+def _fmt_spent(sec: float) -> str:
+    """本次实际用时，说成人话：``8.4 秒`` / ``1 分 23 秒`` / ``1 小时 05 分``。
+
+    用户提的「生成和还原都该显示本次总用时」—— 同一份文件换压缩档、换矩阵、
+    换 WebP 档位到底快了多少，只有把总耗时摆在收尾摘要里才比得出来。
+    """
+    sec = max(0.0, float(sec or 0.0))
+    if sec < 60:
+        return "%.1f 秒" % sec
+    total = int(round(sec))
+    minutes, seconds = divmod(total, 60)
+    if minutes < 60:
+        return "%d 分 %02d 秒" % (minutes, seconds)
+    hours, minutes = divmod(minutes, 60)
+    return "%d 小时 %02d 分" % (hours, minutes)
 
 
 def _fmt_eta(eta) -> str:

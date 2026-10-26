@@ -37,7 +37,7 @@ if errorlevel 1 goto fail
 
 echo [2/3] 命令行 -^> dist\officepack\ ...
 %PY% -m PyInstaller --noconfirm --clean --onedir --console ^
-  --name officepack --paths . ^
+  --name officepack --paths . --icon ..\assets\officepack.ico --add-data "..\assets;assets" ^
   --collect-all qrcode --collect-all zxingcpp ^
   %EXCLUDES% ^
   --distpath dist --workpath build\cli --specpath build ^
@@ -75,7 +75,7 @@ echo ============================================
   scripts\entry_gui.py
 if errorlevel 1 goto fail
 %PY% -m PyInstaller --noconfirm --onefile --console ^
-  --name "officepack-便携单文件（启动慢）" --paths . ^
+  --name "officepack-便携单文件（启动慢）" --paths . --icon ..\assets\officepack.ico --add-data "..\assets;assets" ^
   --collect-all qrcode --collect-all zxingcpp ^
   %EXCLUDES% ^
   --distpath dist --workpath build\cli_one --specpath build ^

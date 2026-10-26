@@ -815,5 +815,63 @@ class SpeedTuneTest(_AppFixture):
             % (content, self.app.opt_canvas.winfo_height()))
 
 
+class CancelAndTempTest(_AppFixture):
+    """「中止」按钮与「清理临时文件」按钮。
+
+    1.4.11 之前只有框选扫描能中止，出码/还原一旦开跑就只能等 —— 957 帧的
+    动图要跑一分钟，中途发现选错格式根本停不下来。
+    """
+
+    def test_stop_button_starts_disabled(self):
+        self.assertEqual(str(self.app.stop_btn["state"]), "disabled",
+                         "没在跑的时候「中止」不该可点")
+
+    def test_stop_button_sits_on_the_same_row_as_start(self):
+        self.assertAlmostEqual(_row_y(self.app.go), _row_y(self.app.stop_btn),
+                               delta=2, msg="开始和中止应在同一行")
+        self.assertLess(_left_x(self.app.go), _left_x(self.app.stop_btn))
+
+    def test_cancel_while_idle_is_a_noop(self):
+        """没在跑的时候点中止不能抛（按钮是禁用的，但快捷键/误触也要安全）。"""
+        self.app._cancel.clear()
+        self.app.cancel_run()
+        self.assertFalse(self.app._cancel.is_set())
+
+    def test_cancel_run_sets_the_event(self):
+        """有工作在跑时点中止，信号要真的置起来（各阶段靠它停）。"""
+        class _FakeWorker:
+            def is_alive(self):
+                return True
+        original = self.app.worker
+        self.app.worker = _FakeWorker()
+        try:
+            self.app._cancel.clear()
+            self.app.cancel_run()
+            self.assertTrue(self.app._cancel.is_set())
+        finally:
+            self.app.worker = original
+            self.app._cancel.clear()
+            self.app.stop_btn.configure(state="disabled", text="中止")
+
+    def test_clean_temp_removes_scan_shots(self):
+        """清理按钮要能删掉历史抓图，并如实报告数量与体积。"""
+        import tempfile as _tf
+
+        victim = os.path.join(_tf.gettempdir(),
+                              gui_mod.SCAN_SHOT_PREFIX + "unittest.png")
+        with open(victim, "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096)
+        self.assertTrue(os.path.exists(victim))
+        removed, freed = self.app.clean_temp(silent=True)
+        self.assertFalse(os.path.exists(victim), "抓图应当被删掉")
+        self.assertGreaterEqual(removed, 1)
+        self.assertGreater(freed, 0)
+
+    def test_clean_temp_reports_zero_when_clean(self):
+        self.app.clean_temp(silent=True)          # 先清干净
+        removed, freed = self.app.clean_temp(silent=True)
+        self.assertEqual((removed, freed), (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,33 @@ class QRError(ValueError):
     pass
 
 
+class Cancelled(Exception):
+    """用户点了「中止」。
+
+    为什么要定义成异常而不是返回 None：出码链路是「预排 → 逐帧渲染 → 并行编码
+    → 拼容器 → 写盘」一路串下去的，靠返回值层层传递「要不要继续」会把每个
+    签名都改脏；抛异常能一次性从最深的循环里跳出来，由 GUI 统一收尾
+    （删中间文件、复位按钮、打印本次用时）。
+
+    各阶段的取消点都是**帧边界**：一帧的渲染/编码是原子的，不会留下半个文件。
+
+    ``partial`` 装的是「中止之前已经真正写进磁盘的文件」。这个信息必须带出来：
+    逐张写 PNG 时，异常是从写盘循环里抛的，调用方手上的返回值还是空的，
+    但磁盘上已经有了几十张图 —— 不告诉用户，收尾提示就会说成
+    「没有写出任何文件」，与实际看到的文件对不上。
+    """
+
+    def __init__(self, message="已中止", partial=None):
+        super().__init__(message)
+        self.partial: list[str] = list(partial or [])
+
+
+def _check_stop(should_stop) -> None:
+    """取消检查点：``should_stop`` 是个无参可调用（通常 ``Event.is_set``）。"""
+    if should_stop is not None and should_stop():
+        raise Cancelled("已中止")
+
+
 # --------------------------------------------------------------------------
 # 分帧
 # --------------------------------------------------------------------------
@@ -259,7 +286,8 @@ def _make_qr_image(text: str, ec: str, target_px: int = 960):
 
 
 def _iter_uniform(texts: Sequence[str], ec: str, target_px: int, progress=None,
-                  base: int = 0, grand_total: int | None = None):
+                  base: int = 0, grand_total: int | None = None,
+                  should_stop=None):
     """把一批文本渲染成**同一像素尺寸**的二维码图（生成器，出一张丢一张）。
 
     为什么必须统一：每帧的数据量不同，QR 版本（模块数）就不同，按
@@ -284,16 +312,19 @@ def _iter_uniform(texts: Sequence[str], ec: str, target_px: int, progress=None,
     plan = None
     if writer is not None:
         try:
-            plan = _plan_zx(writer, texts, level, target_px, progress)
+            plan = _plan_zx(writer, texts, level, target_px, progress, should_stop)
         except _BackendMissing:
             plan = None
     source = _emit_zx(plan) if plan else _iter_uniform_py(texts, level, target_px)
     for idx, im in enumerate(source, 1):
+        # 每帧出一道检查点：896 帧的动图要渲染十几秒，用户点了中止就该立刻停
+        _check_stop(should_stop)
         yield im
         _tick(progress, base + idx, total, "渲染")
 
 
-def _plan_zx(zx, texts: list[str], level: str, target_px: int, progress=None):
+def _plan_zx(zx, texts: list[str], level: str, target_px: int, progress=None,
+             should_stop=None):
     """zxing-cpp 预排：把每帧先编码成矩阵，量出统一倍率，返回 ``(bars, box, side)``。
 
     这一步是**立即执行**的（不是生成器），所以「zxing 没有写码能力」和
@@ -306,6 +337,10 @@ def _plan_zx(zx, texts: list[str], level: str, target_px: int, progress=None):
     total = len(texts)
     bars, counts = [], []
     for i, text in enumerate(texts, 1):
+        # 3825 帧的预排要跑一分钟，这是整条链路里最长的一段静默期：
+        # 不在这里设取消点，用户点「中止」得等一分多钟才有反应。
+        # 每帧查一次：单帧编码 18ms，一次 is_set() 约 0.2µs，开销可忽略。
+        _check_stop(should_stop)
         try:
             bar = zx.create_barcode(text, fmt, ec_level=level)
             # scale=1 → 每模块 1 像素，只用来量「含静区一共多少个模块」
@@ -450,6 +485,7 @@ def render_gif(
     progress=None,
     images=None,
     matrix: int = 1,
+    should_stop=None,
 ) -> str:
     """把多帧合成一张**循环播放的 GIF**：手机对着屏幕录像/扫码就能一次收全。
 
@@ -477,11 +513,17 @@ def render_gif(
     # 但 L 模式的中间图可以用完就丢，峰值内存只多一份 P 图。
     if images is None:
         images = list(anim_images(frames, ec, target_px, markers, progress,
-                                  matrix=matrix))
-    images = [_bilevel(im) for im in images]
+                                  matrix=matrix, should_stop=should_stop))
+    # 转调色板也要能中断：几百帧 L→P 大约 1~2 秒，别让「中止」在这儿卡住
+    bilevel = []
+    for im in images:
+        _check_stop(should_stop)
+        bilevel.append(_bilevel(im))
+    images = bilevel
     # 出图完了还有一步「把 N 帧压成一张动图」，几百帧能跑几十秒。
     # 不报这一步，进度条会停在 100% 一动不动，看起来就像卡死。
     _tick(progress, len(images), len(images), "写入 GIF")
+    _check_stop(should_stop)
     images[0].save(
         out_path, "GIF", save_all=True, append_images=images[1:],
         duration=duration, loop=0, optimize=True, disposal=2,
@@ -612,6 +654,7 @@ def render_webp(
     threads: int = WEBP_THREADS,
     images=None,
     matrix: int = 1,
+    should_stop=None,
 ) -> str:
     """把多帧合成一张**循环播放的动图 WebP**（无损），体积约为 GIF 的 1/5。
 
@@ -664,7 +707,7 @@ def render_webp(
                 _tick(progress, d, t, "排版")
 
         stream = anim_images(frames, ec, target_px, markers, _render_only,
-                             matrix=matrix)
+                             matrix=matrix, should_stop=should_stop)
     else:
         stream = images
     it = iter(stream)
@@ -681,6 +724,7 @@ def render_webp(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = deque([pool.submit(_encode, first)])
         for im in it:
+            _check_stop(should_stop)
             while len(pending) >= workers * 2:
                 blobs.append(pending.popleft().result())
                 done += 1
@@ -690,6 +734,7 @@ def render_webp(
             blobs.append(pending.popleft().result())
             done += 1
             _tick(progress, done, total, "写入")
+    _check_stop(should_stop)
     data = _webp_mux(blobs, first.size, duration)
     with open(out_path, "wb") as fh:
         fh.write(data)
@@ -710,7 +755,7 @@ def _anim_duration(fps: float) -> int:
 
 
 def _anim_source(frames: Sequence[str], ec: str, target_px: int,
-                 markers: bool, progress):
+                 markers: bool, progress, should_stop=None):
     """动图共用：首尾插标识帧 → 统一画布逐帧出图（生成器）。
 
     首帧 S 在前、尾帧 E 在后：识别端见 S 开始收、见 E 收工，不用猜播放相位。
@@ -719,7 +764,8 @@ def _anim_source(frames: Sequence[str], ec: str, target_px: int,
     marks = _mark_texts(frames) if markers else None
     if marks:
         texts = [marks[0]] + texts + [marks[1]]
-    return _iter_uniform(texts, ec, target_px, progress=progress)
+    return _iter_uniform(texts, ec, target_px, progress=progress,
+                         should_stop=should_stop)
 
 
 def _compose_grid(images, per_side: int, gap: int) -> "object":
@@ -760,7 +806,7 @@ def _tile_stream(stream, per_side: int, gap: int = 12):
 
 
 def anim_images(frames: Sequence[str], ec: str, target_px: int, markers: bool = True,
-                progress=None, matrix: int = 1):
+                progress=None, matrix: int = 1, should_stop=None):
     """动图帧流；``matrix``>1 时按 N×N 拼成矩阵帧（一帧放 N² 张码）。
 
     为什么要矩阵：动图的总耗时几乎全花在**播放**上（743 帧 10 帧/秒 = 74 秒）。
@@ -772,7 +818,7 @@ def anim_images(frames: Sequence[str], ec: str, target_px: int, markers: bool = 
         2×2 →  3 帧，单张 1492²
         3×3 →  2 帧，单张 2244²
     """
-    stream = _anim_source(frames, ec, target_px, markers, progress)
+    stream = _anim_source(frames, ec, target_px, markers, progress, should_stop)
     n = max(1, min(3, int(matrix)))
     if n <= 1:
         return stream
@@ -800,6 +846,7 @@ def render_images(
     target_px: int = 960,
     single: bool = True,
     progress=None,
+    should_stop=None,
 ) -> dict:
     """把每帧写成一张 PNG，可选再拼总览图（多帧自动分页，每页 12 张）。
 
@@ -831,22 +878,31 @@ def render_images(
 
     with ThreadPoolExecutor(max_workers=RENDER_THREADS) as pool:
         for start in range(0, total, MAX_SHEET_TILES):
-            page = list(frames[start:start + MAX_SHEET_TILES])
-            tiles = [(start + i + 1, im) for i, im in
-                     enumerate(_iter_uniform(page, ec, target_px,
-                                             progress=progress, base=start,
-                                             grand_total=total))]
-            if single:
-                jobs = [(im, os.path.join(out_dir, "%s.qr%03d.png" % (stem, idx)))
-                        for idx, im in tiles]
-                images.extend(pool.map(_save_png, jobs))
-            if sheet and total > 1:
-                name = ("%s.qr-all.png" % stem if pages == 1
-                        else "%s.qr-all%d.png" % (stem, len(sheets) + 1))
-                path = os.path.join(out_dir, name)
-                _make_sheet(tiles, total, path, ec)
-                sheets.append(path)
-            del tiles
+            try:
+                _check_stop(should_stop)
+                page = list(frames[start:start + MAX_SHEET_TILES])
+                tiles = [(start + i + 1, im) for i, im in
+                         enumerate(_iter_uniform(page, ec, target_px,
+                                                 progress=progress, base=start,
+                                                 grand_total=total,
+                                                 should_stop=should_stop))]
+                if single:
+                    jobs = [(im, os.path.join(out_dir, "%s.qr%03d.png" % (stem, idx)))
+                            for idx, im in tiles]
+                    images.extend(pool.map(_save_png, jobs))
+                if sheet and total > 1:
+                    _check_stop(should_stop)
+                    name = ("%s.qr-all.png" % stem if pages == 1
+                            else "%s.qr-all%d.png" % (stem, len(sheets) + 1))
+                    path = os.path.join(out_dir, name)
+                    _make_sheet(tiles, total, path, ec)
+                    sheets.append(path)
+                del tiles
+            except Cancelled as exc:
+                # 把「已经落盘的文件」带出去：这一页之前的 12 张都写完了，
+                # 不告诉调用方，收尾提示就会说成「什么都没写」，与实际不符
+                exc.partial = images + sheets
+                raise
     return {"images": images, "sheet": sheets[0] if sheets else None,
             "sheets": sheets, "dir": out_dir}
 
@@ -929,23 +985,28 @@ def unpack_any(
     password: str | None = None,
     out_name: str | None = None,
     progress=None,
+    should_stop=None,
 ):
     """文本容器与二维码图片混在一起也能还原；返回 (结果列表, 统计)。"""
     images, texts = partition_sources(sources)
     blocks: list[str] = []
     if images:
-        blocks.extend(decode_images(images, progress=progress))
+        blocks.extend(decode_images(images, progress=progress,
+                                    should_stop=should_stop))
+    _check_stop(should_stop)
     for path in texts:
         with open(path, "r", encoding="utf-8-sig") as fh:
             blocks.append(fh.read())
     if not blocks:
         raise QRError("没有可还原的输入")
+    _check_stop(should_stop)
     results = ct.unpack_texts(blocks, out_dir, password, out_name)
     return results, {"images": len(images), "texts": len(texts), "blocks": len(blocks)}
 
 
 def decode_image(image, deep: bool = True, fast: bool = False,
-                 keep_markers: bool = False, progress=None) -> list[str]:
+                 keep_markers: bool = False, progress=None,
+                 should_stop=None) -> list[str]:
     """识别单张图里的所有二维码；可传路径、PIL 图或 numpy 数组。
 
     多帧图（GIF / 动图 PNG / TIFF）会**逐帧**识别 —— 所以一段动态二维码
@@ -964,10 +1025,11 @@ def decode_image(image, deep: bool = True, fast: bool = False,
 
     if isinstance(image, str):
         with Image.open(image) as img:      # 一定要 close：动图会占着文件句柄
-            return _decode_frames(img, deep, fast, keep_markers, progress)
+            return _decode_frames(img, deep, fast, keep_markers, progress,
+                                  should_stop)
     if not hasattr(image, "mode"):        # numpy 数组之类，交给 zxing 自己处理
         return _read_barcodes(image)
-    return _decode_frames(image, deep, fast, keep_markers, progress)
+    return _decode_frames(image, deep, fast, keep_markers, progress, should_stop)
 
 
 def _probe_frame(item):
@@ -980,7 +1042,8 @@ def _probe_frame(item):
 
 
 def _decode_frames(img, deep: bool = True, fast: bool = False,
-                   keep_markers: bool = False, progress=None) -> list[str]:
+                   keep_markers: bool = False, progress=None,
+                   should_stop=None) -> list[str]:
     """逐帧识别一张图（静态图就是走一帧）。
 
     动图走两轮：先**并行快扫**每一帧的原图（一次像素变换都不做，几十毫秒
@@ -1018,6 +1081,7 @@ def _decode_frames(img, deep: bool = True, fast: bool = False,
 
     if fast:                       # 连拍模式：一枪只认原图，别在单帧上纠缠
         for i in range(count):
+            _check_stop(should_stop)
             img.seek(i)
             _take(_read_one(img, deep=False, fast=True))
         _tick(progress, count, count, "识别")
@@ -1027,6 +1091,7 @@ def _decode_frames(img, deep: bool = True, fast: bool = False,
     workers = max(1, min(DECODE_THREADS, count))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for start in range(0, count, DECODE_BATCH):
+            _check_stop(should_stop)
             stop = min(start + DECODE_BATCH, count)
             batch = []
             for i in range(start, stop):
@@ -1047,6 +1112,7 @@ def _decode_frames(img, deep: bool = True, fast: bool = False,
     # 缺的帧常常是被水印糊住 / 被缩放插值毁掉的那几张，值得单独救一次。
     retry = barren[:DECODE_RETRY]
     for n, i in enumerate(retry, 1):
+        _check_stop(should_stop)
         img.seek(i)
         _take(_read_one(img.copy(), deep=True))
         _tick(progress, n, len(retry), "重试缺帧")
@@ -2166,13 +2232,18 @@ def _expensive_variants(img):
         yield _otsu(tile)
 
 
-def decode_images(paths: Iterable[str], progress=None) -> list[str]:
+def decode_images(paths: Iterable[str], progress=None,
+                  should_stop=None) -> list[str]:
     """把若干张图片/目录里的二维码全部扫出来，按出现顺序去重。
 
     同一张总览图里的多帧、多张单帧图混在一起都可以。
 
     多张图之间**并行**识别：zxing 的 ``read_barcodes`` 会放 GIL，实测 4 张
     同时读比一张张读快 2.4 倍。``progress`` 按「已读完几张图」回调。
+
+    ``should_stop`` 是取消回调：每读完一张图检查一次，命中就抛
+    :class:`Cancelled`。没开始的任务会立刻取消（``cancel_futures``），
+    正在解码的那一两张等它跑完 —— 单张最长也就几秒。
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -2186,7 +2257,11 @@ def decode_images(paths: Iterable[str], progress=None) -> list[str]:
 
     def _one(path):
         try:
-            return decode_image(path, deep=deep), None
+            return decode_image(path, deep=deep, should_stop=should_stop), None
+        except Cancelled:
+            # 中止信号必须往外冒：这里若按「坏图」吞掉，用户点了中止
+            # 却会看到「这 N 张图里没有识别到二维码」的误导提示
+            raise
         except Exception as exc:  # noqa: BLE001  坏图不该让整批失败
             return [], exc
 
@@ -2194,6 +2269,7 @@ def decode_images(paths: Iterable[str], progress=None) -> list[str]:
     seen = set()
     first_error = None
     if total == 1:
+        _check_stop(should_stop)
         found, error = _one(files[0])
         first_error = error
         for text in found:
@@ -2203,8 +2279,10 @@ def decode_images(paths: Iterable[str], progress=None) -> list[str]:
         _tick(progress, 1, 1, "识别")
     else:
         workers = max(1, min(DECODE_THREADS, total))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             for done, (found, error) in enumerate(pool.map(_one, files), 1):
+                _check_stop(should_stop)
                 if error is not None and first_error is None:
                     first_error = error
                 for text in found:
@@ -2212,6 +2290,9 @@ def decode_images(paths: Iterable[str], progress=None) -> list[str]:
                         seen.add(text)
                         texts.append(text)
                 _tick(progress, done, total, "识别图片")
+        finally:
+            # 中止时别等着把所有图都认完：没开始的直接取消
+            pool.shutdown(wait=False, cancel_futures=True)
     if not texts:
         if first_error is not None:
             raise QRError(str(first_error))

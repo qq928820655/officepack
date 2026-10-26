@@ -65,10 +65,21 @@ class PackResult:
     payload: bytes          # 已压缩+加密的字节流（编码前的最终密文）
     preview: str = ""
     ascii_only: bool = False
+    #: 已编码好的文本。打包时算过一次，出码/分段直接复用 —— 16.5MB 走 qr45
+    #: 编码一次就要 5 秒，没理由每往下走一步都重算一遍。
+    encoded: str | None = None
 
     @property
     def text_chars(self) -> int:
         return int(self.meta.get("text_chars", 0))
+
+    def encode_text(self) -> str:
+        """取得（必要时才计算）编码后的文本。"""
+        if self.encoded is None:
+            codec = codec_mod.get_codec(self.meta["codec"], self.meta.get("alphabet"))
+            self.encoded = codec.encode(self.payload)
+            self.meta["text_chars"] = len(self.encoded)
+        return self.encoded
 
 
 @dataclass
@@ -103,6 +114,59 @@ def _expected_enc_size(plain_size: int, cipher_meta: dict) -> int:
     return total
 
 
+#: 打包流水线的进度刻度总数。三段各自耗时差异极大（16.5MB 时压缩 8s、
+#: 加密 0.5s、编码 5s），合成一条 0~1000 的进度才不会被某一段「吃掉」。
+PACK_SCALE = 1000
+
+#: 能按 N 字节对齐就分块编码的编码器（都是定长分组映射，切开拼回去逐字节相同）。
+#: 不在表里的（base91 这类带跨块 bit 状态的）只能整块编码。
+_ENCODE_ALIGN = {"qr45": 2, "base64": 3, "base32": 5, "hex": 1}
+
+
+def _fire(progress, done: int, step: str) -> None:
+    if progress is not None:
+        try:
+            progress(int(done), PACK_SCALE, step)
+        except Exception:  # noqa: BLE001  进度回调绝不能把打包搞崩
+            pass
+
+
+def _stage_progress(progress, base: int, span: int, step: str):
+    """把某一段自己的 done/total 换算到总刻度 base..base+span 上。"""
+    if progress is None:
+        return None
+
+    def report(done, total, _step: str = "") -> None:
+        try:
+            ratio = 0.0 if not total else min(1.0, max(0.0, float(done) / total))
+            progress(int(base + span * ratio), PACK_SCALE, step)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return report
+
+
+def _encode_text(codec, data: bytes, progress=None) -> str:
+    """把密文编码成文本；能分块的编码器按块报进度。
+
+    对齐切分保证每块都是编码器的完整分组，拼回去与整体编码逐字节相同。
+    """
+    align = _ENCODE_ALIGN.get(getattr(codec, "name", ""), 0)
+    total = len(data)
+    if not align or total <= (1 << 20):
+        text = codec.encode(data) if total else ""
+        if progress is not None:
+            progress(1, 1, "编码")
+        return text
+    chunk = max(1 << 20, (total // 40 + align - 1) // align * align)
+    out: list[str] = []
+    for start in range(0, total, chunk):
+        out.append(codec.encode(data[start:start + chunk]))
+        if progress is not None:
+            progress(min(start + chunk, total), total, "编码")
+    return "".join(out)
+
+
 def pack_bytes(
     raw: bytes,
     name: str,
@@ -115,20 +179,30 @@ def pack_bytes(
     level: int | None = None,
     preview: bool = True,
     ascii_only: bool = False,
+    progress=None,
 ) -> PackResult:
+    """打包一段字节。
+
+    ``progress(done, total, 阶段)`` 把「压缩 → 加密 → 编码」三段合成一条
+    0~1000 的进度（``total`` 固定 1000）。不拆开的话，16.5MB 的文件在这三步
+    上要花一分钟，界面上就只能挂个「0%」，看着像死了。
+    """
     codec = codec_mod.get_codec(codec_name, alphabet)
     sha256_hex = hashlib.sha256(raw).hexdigest()
     size = len(raw)
 
-    body, compress_info = compress_mod.compress(raw, compress, level)
+    body, compress_info = compress_mod.compress(
+        raw, compress, level, progress=_stage_progress(progress, 0, 700, "压缩"))
     cipher = crypto_mod.make_cipher(cipher_name, password, len(body))
     aad = _aad(sha256_hex, size)
+    _fire(progress, 700, "加密")
     encrypted, cipher_meta = cipher.encrypt(body, aad)
     cipher_meta["plain_size"] = len(body)
 
     ext = os.path.splitext(name)[1].lower()
     text_preview = extract_preview(ext, raw) if preview else ""
-    text_chars = len(codec.encode(encrypted)) if encrypted else 0
+    encoded = _encode_text(codec, encrypted,
+                           progress=_stage_progress(progress, 770, 230, "编码"))
 
     meta = {
         "v": VERSION,
@@ -140,8 +214,8 @@ def pack_bytes(
         "compress": compress_info,
         "plain_size": len(body),
         "enc_size": len(encrypted),
-        "text_chars": text_chars,
-        "ratio": round(size / text_chars, 3) if text_chars else 0,
+        "text_chars": len(encoded),
+        "ratio": round(size / len(encoded), 3) if encoded else 0,
         "cipher": cipher_meta,
         "created": _now(),
         "tool": TOOL_ID,
@@ -149,7 +223,8 @@ def pack_bytes(
     if codec.name == "custom":
         meta["alphabet"] = codec.alphabet  # type: ignore[attr-defined]
     return PackResult(meta=meta, payload=encrypted, preview=text_preview,
-                      ascii_only=ascii_only)
+                      ascii_only=ascii_only, encoded=encoded)
+
 
 
 def _ascii_safe(text: str) -> str:
@@ -159,8 +234,8 @@ def _ascii_safe(text: str) -> str:
 
 def render(pack: PackResult) -> str:
     meta = pack.meta
-    codec = codec_mod.get_codec(meta["codec"], meta.get("alphabet"))
-    encoded = codec.encode(pack.payload)
+    # 打包时已经编码过一次，这里直接复用（16.5MB 走 qr45 再编一次要 5 秒）
+    encoded = pack.encode_text()
     meta["text_chars"] = len(encoded)
 
     meta_b64 = _meta_b64(meta)
@@ -217,6 +292,7 @@ def pack_file(
     ascii_only: bool = False,
     segment: int = 0,
     parts: int = 0,
+    progress=None,
 ) -> tuple[list[str], dict]:
     """打包文件；返回 (输出路径列表, 元信息)。分段时返回多个路径。"""
     with open(src, "rb") as fh:
@@ -232,6 +308,7 @@ def pack_file(
         level=level,
         preview=preview,
         ascii_only=ascii_only,
+        progress=progress,
     )
 
     if segment or parts:
@@ -330,8 +407,7 @@ def split_pack(
     每段头部含文档 ID、序号/总数、段 CRC32 —— 可乱序收集，缺段/截断能立刻定位。
     """
     meta = pack.meta
-    codec = codec_mod.get_codec(meta["codec"], meta.get("alphabet"))
-    encoded = codec.encode(pack.payload)
+    encoded = pack.encode_text()
     meta["text_chars"] = len(encoded)
     meta_line = META_PREFIX + _meta_b64(meta)
     meta_len = len(meta_line) + 1

@@ -64,7 +64,7 @@ from .qr import (
     unpack_images,
 )
 
-__version__ = "1.4.4"
+__version__ = "1.4.10"
 
 __all__ = [
     "BEGIN",

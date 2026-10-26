@@ -9,6 +9,30 @@ import sys
 import traceback
 
 
+def _enable_dpi_awareness() -> None:
+    """必须在创建任何窗口之前调用。
+
+    不声明 DPI 感知时 Windows 会把整个窗口当成位图按缩放比拉伸：实测 125% 屏上
+    exe 的窗口矩形是 1160x1130，但 PrintWindow 只画了左上角 928x904（正好 1/1.25）
+    再放大填满 —— 字是虚的，而且 Tk 报的逻辑坐标与 ``SPI_GETWORKAREA`` 给的物理
+    坐标差着一层缩放。之前那个「窗口底边压到任务栏下面 89px」的怪毛病就是这笔账。
+    源码运行走的是 ``officepack.gui.main()``，那里早就调了，只有打包入口漏了。
+    """
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_DPI_AWARE
+        return
+    except Exception:  # noqa: BLE001 - 老系统没有 shcore
+        pass
+    try:
+        import ctypes
+
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _fatal(exc: BaseException) -> None:
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     try:
@@ -104,6 +128,21 @@ def _run_gui() -> int:
 
 
 if __name__ == "__main__":
+    _enable_dpi_awareness()          # 任何窗口创建之前
+    # 抓屏自检：主程序会拿这个入口再启动一个自己，专门试 DXGI 桌面复制。
+    # 必须**在创建 Tk 之前**就分流，否则会闪出一个空窗口；驱动不支持时子进程
+    # 会崩（访问违例），也只能崩在这里，不能把主窗口一起带走。
+    if "--probe-grab" in sys.argv:
+        # 注意别在 try 里直接 sys.exit()：SystemExit 是 BaseException，
+        # 会被下面的兜底捕获，退出码就从 0 变成 2 了（实测踩过）。
+        code = 2
+        try:
+            from officepack import screengrab
+
+            code = int(screengrab._main(sys.argv[1:]) or 0)
+        except BaseException:  # noqa: BLE001 - 子进程无论如何都不能弹错误框
+            code = 2
+        sys.exit(code)
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     try:

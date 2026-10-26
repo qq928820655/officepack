@@ -244,16 +244,24 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
             gif_path = None
             webp_path = None
             fps = args.qr_gif or 3.0
+            # 一帧拼 N² 张码：帧数降到 1/N²，播一轮的时间同比例缩短。
+            # 只在要出动图时才拼（单帧 PNG 仍是一张一码）。
+            anim_imgs = None
+            if args.qr_matrix > 1 and len(frames) > 1:
+                anim_imgs = list(qr.anim_images(frames, args.qr_ec,
+                                                min(args.qr_px, 720), True, tick,
+                                                matrix=args.qr_matrix))
             if len(frames) > 1 and (args.qr_gif or args.qr_webp):
                 if args.qr_gif:
                     gif_path = os.path.join(target_dir, "%s.qr.gif" % stem)
                     qr.render_gif(frames, gif_path, ec=args.qr_ec,
                                   fps=args.qr_gif, target_px=min(args.qr_px, 720),
-                                  progress=tick)
+                                  progress=tick, images=anim_imgs)
                 if args.qr_webp:
                     webp_path = os.path.join(target_dir, "%s.qr.webp" % stem)
                     qr.render_webp(frames, webp_path, ec=args.qr_ec, fps=fps,
-                                   target_px=min(args.qr_px, 720), progress=tick)
+                                   target_px=min(args.qr_px, 720), progress=tick,
+                                   images=anim_imgs)
         except (qr.QRError, OSError) as exc:
             print("✗ %s：生成二维码失败 %s" % (os.path.basename(src), exc))
             failed += 1
@@ -295,6 +303,12 @@ def _pack_as_qr(args, codec_name, compress_mode, level, cipher_name, password, o
             print("   动图 WebP %s（无损，体积约为 GIF 的 1/5；"
                   "能播它的播放器比 GIF 少，拿不准就用 GIF）"
                   % os.path.basename(webp_path))
+        if anim_imgs:
+            print("   矩阵 %d×%d：%d 张码拼成 %d 张大图再出动图（每张码 %s，"
+                  "屏幕上要显示到约 %dpx 才认得出；识别端不用配，自动切块并行解码）"
+                  % (args.qr_matrix, args.qr_matrix, len(frames), len(anim_imgs),
+                     "约一半宽" if args.qr_matrix == 2 else "约三分之一宽",
+                     700 if args.qr_matrix == 2 else 1250))
     return 1 if failed else 0
 
 
@@ -506,6 +520,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_pack.add_argument("--qr-webp", action="store_true",
                         help="额外输出**无损动图 WebP**：逐像素无损，体积约为 GIF 的 1/5；"
                              "代价是能播它的播放器比 GIF 少（Windows 照片/微信可能只显示首帧）")
+    p_pack.add_argument("--qr-matrix", type=int, choices=[1, 2, 3], default=1,
+                        metavar="N",
+                        help="动图一帧拼 N×N 张码（1/2/3，默认 1）：帧数降到 1/N²、"
+                             "播一轮的时间同比例缩短；代价是屏幕上每张码只有 1/N 宽，"
+                             "3×3 需要显示到约 1250px")
     add_pack_opts(p_pack)
     p_pack.set_defaults(func=cmd_pack)
 

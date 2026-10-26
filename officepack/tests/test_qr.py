@@ -220,5 +220,35 @@ class QRImageRoundTripTest(unittest.TestCase):
             qr.decode_images([blank])
 
 
+class WebPEncodeTest(unittest.TestCase):
+    """WebP 动图的编码档位：小文件省体积、大文件省时间。"""
+
+    def test_method_scales_with_frame_count(self):
+        """几百帧的大文件自动切到最快档，小文件仍用省体积档。"""
+        self.assertEqual(qr.webp_method_for(10), qr.WEBP_METHOD)
+        self.assertEqual(qr.webp_method_for(qr.WEBP_FAST_FRAMES),
+                         qr.WEBP_FAST_METHOD)
+        self.assertLess(qr.WEBP_FAST_METHOD, qr.WEBP_METHOD,
+                        "「最快档」的 method 必须比默认档更小（libwebp 里越小越快）")
+
+    def test_webp_only_export_is_playable(self):
+        """单 WebP 导出：写出来的必须是能解码的动图，帧数对得上。"""
+        from PIL import Image
+
+        pack = ct.pack_bytes(os.urandom(9000), "w.bin", codec_name="qr45",
+                             compress="none", cipher_name="none", password=None,
+                             preview=False, ascii_only=True)
+        frames = qr.build_frames(pack, ec="M")
+        self.assertGreater(len(frames), 1, "样本压成了一帧，测不出动图")
+        tmp = tempfile.mkdtemp(prefix="opk-webp-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, True))
+        out = qr.render_webp(frames, os.path.join(tmp, "w.webp"), ec="M",
+                             fps=3, target_px=480)
+        with Image.open(out) as im:
+            self.assertEqual(getattr(im, "n_frames", 1), len(frames) + 2,
+                             "动图帧数应当 = 数据帧 + 首尾标识帧")
+            self.assertEqual(im.format, "WEBP")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -427,6 +427,21 @@ def test_gui() -> str:
 
 
 # --------------------------------------------------------------------------
+def test_icons_bundled():
+    """assets 没打进包，窗口标题栏和任务栏就是白板（这个坑踩过两次）。"""
+    root = os.path.dirname(GUI)
+    cands = [os.path.join(root, "_internal", "assets", "officepack.ico"),
+             os.path.join(root, "assets", "officepack.ico")]
+    found = [p for p in cands if os.path.isfile(p)]
+    if not found:
+        raise RuntimeError("包里没有 assets/officepack.ico —— 窗口和任务栏会没图标")
+    folder = os.path.dirname(found[0])
+    pngs = sorted(n for n in os.listdir(folder) if n.endswith(".png"))
+    if len(pngs) < 3:
+        raise RuntimeError("图标 PNG 不全（只有 %s）" % pngs)
+    return "ico + %d 张 png" % len(pngs)
+
+
 def main() -> int:
     print("=" * 78)
     print("  officepack 发布前功能验证")
@@ -465,6 +480,7 @@ def main() -> int:
 
     print("\n[8] 瘦身完整性")
     check("精简后功能仍然正常", test_trimmed_bundle_intact)
+    check("图标资源已打进包", test_icons_bundled)
 
     if "--no-gui" not in sys.argv:
         print("\n[9] 图形界面")

@@ -27,7 +27,8 @@ echo ============================================
 
 echo [1/3] 图形界面 -^> dist\OfficePack-GUI\ ...
 %PY% -m PyInstaller --noconfirm --clean --onedir --windowed ^
-  --name OfficePack-GUI --paths . --collect-all tkinterdnd2 ^
+  --name OfficePack-GUI --paths . --icon ..\assets\officepack.ico ^
+  --add-data "..\assets;assets" --collect-all tkinterdnd2 ^
   --collect-all qrcode --collect-all zxingcpp --collect-all PIL ^
   %EXCLUDES% ^
   --distpath dist --workpath build\gui --specpath build ^
@@ -66,7 +67,8 @@ echo ============================================
 echo  构建单文件便携版
 echo ============================================
 %PY% -m PyInstaller --noconfirm --onefile --windowed ^
-  --name "OfficePack-GUI-便携单文件（启动慢）" --paths . --collect-all tkinterdnd2 ^
+  --name "OfficePack-GUI-便携单文件（启动慢）" --paths . --icon ..\assets\officepack.ico ^
+  --add-data "..\assets;assets" --collect-all tkinterdnd2 ^
   --collect-all qrcode --collect-all zxingcpp --collect-all PIL ^
   %EXCLUDES% ^
   --distpath dist --workpath build\gui_one --specpath build ^

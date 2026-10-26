@@ -18,8 +18,14 @@
 
 from __future__ import annotations
 
+import io
 import math
 import os
+from collections import deque
+import random
+import struct
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Sequence
 
 from . import codecs as codec_mod
@@ -278,7 +284,7 @@ def _iter_uniform(texts: Sequence[str], ec: str, target_px: int, progress=None,
     plan = None
     if writer is not None:
         try:
-            plan = _plan_zx(writer, texts, level, target_px)
+            plan = _plan_zx(writer, texts, level, target_px, progress)
         except _BackendMissing:
             plan = None
     source = _emit_zx(plan) if plan else _iter_uniform_py(texts, level, target_px)
@@ -287,15 +293,19 @@ def _iter_uniform(texts: Sequence[str], ec: str, target_px: int, progress=None,
         _tick(progress, base + idx, total, "渲染")
 
 
-def _plan_zx(zx, texts: list[str], level: str, target_px: int):
+def _plan_zx(zx, texts: list[str], level: str, target_px: int, progress=None):
     """zxing-cpp 预排：把每帧先编码成矩阵，量出统一倍率，返回 ``(bars, box, side)``。
 
     这一步是**立即执行**的（不是生成器），所以「zxing 没有写码能力」和
     「这一帧太大装不下」这两种错误都能在出第一张图之前就报出来。
+
+    3825 帧的预排要跑一分钟左右（每帧一次完整的 QR 编码），必须报进度 ——
+    以前这里是个彻底的静默黑洞，界面停在上一阶段的「0%」上，看着就是卡死。
     """
     fmt = getattr(zx.BarcodeFormat, "QRCode")
+    total = len(texts)
     bars, counts = [], []
-    for text in texts:
+    for i, text in enumerate(texts, 1):
         try:
             bar = zx.create_barcode(text, fmt, ec_level=level)
             # scale=1 → 每模块 1 像素，只用来量「含静区一共多少个模块」
@@ -306,6 +316,7 @@ def _plan_zx(zx, texts: list[str], level: str, target_px: int):
             raise QRError("二维码内容超出容量（%s）：请降低纠错级别，"
                           "或调小每帧字符数/改用 qr45 编码" % exc) from None
         bars.append(bar)
+        _tick(progress, i, total, "排版")
     box = max(3, int(round(float(target_px) / max(counts))))
     return bars, box, max(counts) * box
 
@@ -437,6 +448,8 @@ def render_gif(
     target_px: int = 720,
     markers: bool = True,
     progress=None,
+    images=None,
+    matrix: int = 1,
 ) -> str:
     """把多帧合成一张**循环播放的 GIF**：手机对着屏幕录像/扫码就能一次收全。
 
@@ -451,6 +464,8 @@ def render_gif(
     它就是「见首帧清零、逐帧收、见尾帧收工」，漏帧还能靠下一轮补齐。
 
     ``progress(done, total, phase)`` 每出一帧回调一次，用来刷进度条。
+    ``images`` 可以传入**已经渲染好的 L 模式帧**（同时要出 GIF 和 WebP 时，
+    两边共用一份，别把几百帧重画两遍）。
     """
     if not frames:
         raise QRError("没有可渲染的帧")
@@ -460,8 +475,10 @@ def render_gif(
 
     # 边出图边转调色板：GIF 必须一次性拿到所有帧（PIL 的 save_all 要完整列表），
     # 但 L 模式的中间图可以用完就丢，峰值内存只多一份 P 图。
-    images = [_bilevel(im)
-              for im in _anim_source(frames, ec, target_px, markers, progress)]
+    if images is None:
+        images = list(anim_images(frames, ec, target_px, markers, progress,
+                                  matrix=matrix))
+    images = [_bilevel(im) for im in images]
     # 出图完了还有一步「把 N 帧压成一张动图」，几百帧能跑几十秒。
     # 不报这一步，进度条会停在 100% 一动不动，看起来就像卡死。
     _tick(progress, len(images), len(images), "写入 GIF")
@@ -472,9 +489,115 @@ def render_gif(
     return out_path
 
 
-#: WebP 动图的编码档位。``method`` 是 libwebp 的速度/压缩权衡（0 最快、6 最狠），
-#: 实测 4 是拐点：再往上（6）压缩率只多 0.1%，耗时却从 80ms/帧 涨到 5.3s/帧。
-WEBP_METHOD = 4
+#: WebP 动图的编码档位。``method`` 是 libwebp 的速度/压缩权衡（0 最快、6 最狠）。
+#:
+#: 实测（56 帧、每帧 740px 二值图、同一批帧）：
+#:   method=0 → 25ms/帧  9.1KB/帧
+#:   method=1 → 45ms/帧  6.4KB/帧
+#:   method=2 → 53ms/帧  6.4KB/帧
+#:   method=3 → 55ms/帧  6.4KB/帧
+#:   method=6 → 1.1s/帧  6.4KB/帧   ← 慢 20 倍，体积一分没省
+#: 二维码是纯黑白大色块，method 过了 1 就压不动了，只烧时间。所以取 1：
+#: 体积和 2/3 完全一样，时间省两成。
+WEBP_METHOD = 1
+
+#: 大文件（几百帧）再降一档到「最快」：体积大 40%，时间砍一半。
+#: 983 帧实测 method=1 要 44 秒、method=0 只要 24 秒。这图是拿去**在屏幕上播放**
+#: 再被框选识别的，多 2MB 无所谓，多等 20 秒才难受。
+WEBP_FAST_FRAMES = 400
+WEBP_FAST_METHOD = 0
+
+#: 「WebP 能不能多线程合成」——不能，至少通过 Pillow 不能：
+#: libwebp 的**无损**编码器（VP8L）是单线程的，``thread_level`` 只对 VP8 有损生效，
+#: Pillow 的 ``threads=`` 参数实测对无损只有 ±5% 的噪声（56 帧：0 线程 1.19s、
+#: 4 线程 1.19s）。要真并行只能自己拼 RIFF/ANMF 容器、拿多个线程各压一帧再拼起来，
+#: 代价是丢掉帧间预测（体积涨 1.5 倍以上）＋一个手写容器解析器的风险。
+#: 所以这里不折腾线程，省时间靠三件确定有效的事：
+#:   1. ``method`` 降档（上面）；
+#:   2. GIF + WebP 同时要时帧只渲染一遍（``images=`` 参数，渲染约 10ms/帧）；
+#:   3. 只选 WebP 时不渲染 PNG（以前会先白画一遍 PNG）。
+WEBP_THREADS = 0
+
+
+def webp_method_for(n_frames: int, mode: str | None = None) -> int:
+    """这份帧数该用哪一档 ``method``。
+
+    ``mode`` 是用户选的「速度优先 / 体积优先」：速度档快近一倍、体积大四成；
+    体积档体积最小，再往上压（method=2/3）体积一分不省、时间却翻倍。
+    没给 ``mode`` 时按帧数自动挑：大文件优先保时间。
+    """
+    if mode:
+        return WEBP_FAST_METHOD if "速度" in str(mode) else WEBP_METHOD
+    return WEBP_FAST_METHOD if int(n_frames) >= WEBP_FAST_FRAMES else WEBP_METHOD
+
+
+def _u24(n: int) -> bytes:
+    return bytes((n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF))
+
+
+def _riff_chunk(fourcc: bytes, payload: bytes) -> bytes:
+    pad = b"\x00" if len(payload) & 1 else b""
+    return fourcc + struct.pack("<I", len(payload)) + payload + pad
+
+
+def _webp_image_chunks(data: bytes) -> bytes:
+    """从单帧 WebP 文件里剥出图像 chunk（VP8L/VP8/ALPH），丢掉 RIFF 头。"""
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        raise QRError("单帧 WebP 头不合法，无法拼动画")
+    out: list[bytes] = []
+    pos, end = 12, len(data)
+    while pos + 8 <= end:
+        fourcc = data[pos:pos + 4]
+        size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        if fourcc in (b"VP8 ", b"VP8L", b"ALPH"):
+            out.append(data[pos:pos + 8 + size])
+        pos += 8 + size + (size & 1)
+    if not out:
+        raise QRError("单帧 WebP 里没有图像数据，无法拼动画")
+    return b"".join(out)
+
+
+def _webp_mux(frames: list[bytes], size: tuple[int, int], duration: int,
+              loop: int = 0) -> bytes:
+    """把一批**单帧 WebP 文件**拼成一个 WebP 动画容器（RIFF/ANIM/ANMF）。
+
+    为什么不直接 ``images[0].save(save_all=True)``：那条路走 libwebp 的
+    WebPAnimEncoder，一次性写完整段视频，既拿不到中途进度（界面只能停在
+    100%），也没法吃满多核（编码器内部是串行的）。实测 957 帧要 40~85 秒。
+    自己拼容器后，每帧可以独立并行编码（libwebp 编码会释放 GIL，实测 8 线程
+    6.5 倍加速），957 帧从 40 秒降到 6~7 秒，而且每编码一帧就能报一次进度。
+    """
+    w, h = int(size[0]), int(size[1])
+    body = [b"WEBP"]
+    # VP8X: 只置 Animation 标志位（bit1）；画布尺寸字段存的是「宽-1」
+    body.append(_riff_chunk(b"VP8X", bytes([0x02]) + b"\x00\x00\x00"
+                            + _u24(w - 1) + _u24(h - 1)))
+    # ANIM: 背景色 BGRA（白，与二维码静区一致）+ 循环次数（0 = 无限）
+    body.append(_riff_chunk(b"ANIM",
+                            struct.pack("<I", 0xFFFFFFFF) + struct.pack("<H", loop)))
+    for blob in frames:
+        # ANMF: 帧位置(0,0)、尺寸(宽-1,高-1)、时长、flags(B=1 不混合, D=0 不清理)
+        payload = (_u24(0) + _u24(0) + _u24(w - 1) + _u24(h - 1)
+                   + _u24(int(duration)) + bytes([0x02]) + _webp_image_chunks(blob))
+        body.append(_riff_chunk(b"ANMF", payload))
+    data = b"".join(body)
+    return b"RIFF" + struct.pack("<I", len(data)) + data
+
+
+def _anim_frame_count(frames: Sequence[str], markers: bool, matrix: int) -> int:
+    """按「数据帧 + 首尾标识帧，再按 N×N 拼接」推算动图帧数。
+
+    流式渲染时拿不到现成的列表长度，进度条的总数只能先算出来 ——
+    算法必须和 :func:`anim_images` 的实际产出一致，否则进度会跑过 100%。
+    """
+    total = len(frames)
+    if markers and total > 1:
+        total += 2
+    side = max(1, min(3, int(matrix)))
+    if side > 1:
+        per = side * side
+        total = int(math.ceil(total / float(per)))
+    return max(1, total)
 
 
 def render_webp(
@@ -485,7 +608,10 @@ def render_webp(
     target_px: int = 720,
     markers: bool = True,
     progress=None,
-    method: int = WEBP_METHOD,
+    method: int | None = None,
+    threads: int = WEBP_THREADS,
+    images=None,
+    matrix: int = 1,
 ) -> str:
     """把多帧合成一张**循环播放的动图 WebP**（无损），体积约为 GIF 的 1/5。
 
@@ -514,18 +640,73 @@ def render_webp(
         raise QRError("只有一帧，用静态图就够了，不需要动图")
     duration = _anim_duration(fps)
     # 无损 WebP 直接吃 L 模式原图：它内部自己会做二值友好的预测，不需要调色板
-    images = list(_anim_source(frames, ec, target_px, markers, progress))
-    _tick(progress, len(images), len(images), "写入 WebP")
-    images[0].save(
-        out_path, "WEBP", save_all=True, append_images=images[1:],
-        duration=duration, loop=0, lossless=True, quality=100, method=method,
-    )
+    total = (len(images) if images is not None
+             else _anim_frame_count(frames, markers, matrix))
+    if method is None:
+        # 几百帧的大文件优先保时间：体积差 40%，时间差一倍
+        method = webp_method_for(total)
+    _tick(progress, 0, total, "写入")
+
+    def _encode(im):
+        buf = io.BytesIO()
+        im.save(buf, "WEBP", lossless=True, quality=100, method=method)
+        return buf.getvalue()
+
+    if images is None:
+        # 流式：出帧和编码同时走，内存里只留「在飞的几帧」。
+        # 以前是 list(anim_images(...)) 全量留住 —— 215 帧 1492² 就是 470MB，
+        # 3800 帧更是直接吃满内存，表现出来就是「写入 77% 之后再也不动了」。
+        def _render_only(d, t, step):
+            # 只放行「排版」（zxing 预排要跑一分钟，不能又是黑箱）；
+            # 逐帧渲染的进度不单独报 —— 它和下面的「写入」是一对一的，
+            # 两条进度交错跳来跳去反而看不清在干什么。
+            if step == "排版":
+                _tick(progress, d, t, "排版")
+
+        stream = anim_images(frames, ec, target_px, markers, _render_only,
+                             matrix=matrix)
+    else:
+        stream = images
+    it = iter(stream)
+    try:
+        first = next(it)
+    except StopIteration:
+        raise QRError("没有可渲染的帧") from None
+
+    # 逐帧并行编码：libwebp 编码时释放 GIL，实测 8 线程 6.5 倍（40s → 6s），
+    # 而且每编完一帧就报一次进度 —— 不再是一条卡在 100% 的死进度条。
+    workers = max(1, min(8, int(threads) or (os.cpu_count() or 2)))
+    blobs: list[bytes] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque([pool.submit(_encode, first)])
+        for im in it:
+            while len(pending) >= workers * 2:
+                blobs.append(pending.popleft().result())
+                done += 1
+                _tick(progress, done, total, "写入")
+            pending.append(pool.submit(_encode, im))
+        while pending:
+            blobs.append(pending.popleft().result())
+            done += 1
+            _tick(progress, done, total, "写入")
+    data = _webp_mux(blobs, first.size, duration)
+    with open(out_path, "wb") as fh:
+        fh.write(data)
     return out_path
 
 
+
 def _anim_duration(fps: float) -> int:
-    """帧率 → 每帧毫秒数；夹在 0.5~10 之间（相机对焦+解码要 150ms 以上）。"""
-    return max(0, int(round(1000.0 / max(0.5, min(10.0, float(fps))))))
+    """帧率 → 每帧毫秒数；夹在 0.5~20 之间。
+
+    上限从 10 提到 20（50ms/帧）：电脑框选是「屏幕自己播、程序自己抓」，
+    20 帧/秒时一帧还能被抓到两次以上，743 帧的动图从 4 分钟压到 37 秒。
+    GIF 的延时单位是 10ms，20 帧/秒正好 5 个单位，不会被播放器取整掉。
+
+    手机扫别用这么高：相机对焦 + 解码要 150ms 以上，3~6 帧/秒最稳。
+    """
+    return max(0, int(round(1000.0 / max(0.5, min(20.0, float(fps))))))
 
 
 def _anim_source(frames: Sequence[str], ec: str, target_px: int,
@@ -539,6 +720,64 @@ def _anim_source(frames: Sequence[str], ec: str, target_px: int,
     if marks:
         texts = [marks[0]] + texts + [marks[1]]
     return _iter_uniform(texts, ec, target_px, progress=progress)
+
+
+def _compose_grid(images, per_side: int, gap: int) -> "object":
+    """把至多 per_side² 张同尺寸图拼成一张；空位留白。
+
+    静区不用另加：每张图自己已经带 4 模块白边，两张相邻就是 8 模块，
+    远超二维码要求的 4 模块。``gap`` 只是让屏幕放大时两码边界更好认。
+    """
+    from PIL import Image
+
+    filled = [im for im in images if im is not None]
+    side = max((im.width for im in filled), default=0)
+    if side <= 0:
+        return None
+    total = side * per_side + gap * (per_side - 1)
+    canvas = Image.new("L", (total, total), 255)
+    for idx, im in enumerate(images):
+        if im is None:
+            continue
+        row, col = divmod(idx, per_side)
+        x = col * (side + gap) + (side - im.width) // 2
+        y = row * (side + gap) + (side - im.height) // 2
+        canvas.paste(im, (x, y))
+    return canvas
+
+
+def _tile_stream(stream, per_side: int, gap: int = 12):
+    """把单码图流按 per_side×per_side 拼起来，出一张丢一张。"""
+    need = per_side * per_side
+    buf = []
+    for im in stream:
+        buf.append(im)
+        if len(buf) == need:
+            yield _compose_grid(buf, per_side, gap)
+            buf = []
+    if buf:
+        yield _compose_grid(buf + [None] * (need - len(buf)), per_side, gap)
+
+
+def anim_images(frames: Sequence[str], ec: str, target_px: int, markers: bool = True,
+                progress=None, matrix: int = 1):
+    """动图帧流；``matrix``>1 时按 N×N 拼成矩阵帧（一帧放 N² 张码）。
+
+    为什么要矩阵：动图的总耗时几乎全花在**播放**上（743 帧 10 帧/秒 = 74 秒）。
+    一帧放 N² 张码，播放时长直接砍到 1/N²。代价是同样显示面积下每张码只有
+    1/N 宽 —— 所以屏幕得放到约 N 倍大，模块才还是 2px 以上。
+
+    实测（9 帧数据 + 2 个标识帧）：
+        1×1 → 11 帧，单张  740²
+        2×2 →  3 帧，单张 1492²
+        3×3 →  2 帧，单张 2244²
+    """
+    stream = _anim_source(frames, ec, target_px, markers, progress)
+    n = max(1, min(3, int(matrix)))
+    if n <= 1:
+        return stream
+    return _tile_stream(stream, n)
+
 
 
 def _save_png(job) -> str:
@@ -727,10 +966,7 @@ def decode_image(image, deep: bool = True, fast: bool = False,
         with Image.open(image) as img:      # 一定要 close：动图会占着文件句柄
             return _decode_frames(img, deep, fast, keep_markers, progress)
     if not hasattr(image, "mode"):        # numpy 数组之类，交给 zxing 自己处理
-        import zxingcpp
-
-        results = zxingcpp.read_barcodes(image)
-        return [r.text for r in results if r.text]
+        return _read_barcodes(image)
     return _decode_frames(image, deep, fast, keep_markers, progress)
 
 
@@ -841,6 +1077,197 @@ BATCH_BUDGET = 1.5
 UPSCALE_LIMIT = 6_000_000
 
 
+def _read_barcodes(img, fast: bool = False) -> list[str]:
+    """统一的 zxing 调用口：**只找二维码**。
+
+    这一步是整条识别链最值钱的优化。``read_barcodes`` 默认会把一维码、PDF417、
+    Aztec……全部格式扫一遍，实测同一张 740×740 的码：
+
+    * 默认（全格式 + 旋转 + 反色 + 缩放搜索）：**46ms**
+    * 只找 QR：9ms
+    * 只找 QR + 不试旋转 + 不试反色：9ms（省下的主要是格式遍历）
+
+    连拍（``fast=True``）再加两条：屏幕上的码永远是正着的、也不会是反色，
+    这两个搜索纯属白跑 —— 加上后 5.6ms/帧，一枪从 46ms 降到 9ms 以内。
+
+    ``try_downscale`` 保持默认开：看图软件把图缩小显示时，它还能把码找回来。
+    """
+    import zxingcpp
+
+    opts = {}
+    try:
+        opts["formats"] = zxingcpp.BarcodeFormat.QRCode
+        if fast:
+            opts["try_rotate"] = False
+            opts["try_invert"] = False
+        return [r.text for r in zxingcpp.read_barcodes(img, **opts) if r.text]
+    except TypeError:      # 老版本 zxingcpp 不认这些关键字参数
+        return [r.text for r in zxingcpp.read_barcodes(img) if r.text]
+
+
+#: 矩阵帧（一帧放 N×N 张码）的自动识别与分块并行解码
+#: 单码帧 740²≈0.55M 像素，2×2 ≈2.2M，3×3 ≈5M —— 拿这个阈值先粗筛，省得每枪都去数格子
+GRID_PROBE_PIXELS = 1_200_000
+_TILE_POOL = None
+
+
+def _gap_spans(profile: bytes, white: int = 244) -> list[tuple[int, int]]:
+    """找出一条亮度投影里「贯穿整列/整行的白缝」，返回各自的样本区间。
+
+    矩阵帧的做法是把 N² 张码并排贴上白底画布，格子之间一定有一条**贯穿整行/整列**
+    的白缝。二维码内部再白也白不满一整列（定位符和时序图案保证约一半是黑的），
+    所以「整列平均亮度接近 255」就等价于「这是格子之间的缝」。
+
+    贴边的白条是图片外边距（静区），不是缝，要排除。
+    """
+    n = len(profile)
+    min_run = max(2, n // 200)      # 过窄的白点只是模块噪声，不是缝
+    spans = []
+    i = 0
+    while i < n:
+        if profile[i] >= white:
+            j = i
+            while j < n and profile[j] >= white:
+                j += 1
+            if i > 0 and j < n and (j - i) >= min_run:
+                spans.append((i, j))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def _count_cells(profile: bytes) -> int:
+    return len(_gap_spans(profile)) + 1
+
+
+def _grid_profiles(img, samples: int = 256):
+    """把图压成两条亮度投影：每个样本 = 一整列（或一整行）的平均亮度。"""
+    from PIL import Image
+
+    g = img if img.mode == "L" else img.convert("L")
+    # 先按整数倍缩一次（PIL 的 reduce 是 C 实现），再按 BOX 重采样成投影。
+    # 直接对 2200² 的原图缩到 256 要 4ms，先 reduce 到 1/4 只要 0.6ms，
+    # 结果等价（两遍都是面积平均）。
+    if g.width > 640:
+        g = g.reduce(max(1, g.width // 480))
+    cols = g.resize((samples, 1), Image.BOX).tobytes()
+    rows = g.resize((1, samples), Image.BOX).tobytes()
+    return cols, rows
+
+
+def _grid_side(img) -> tuple[int, int]:
+    """判断这张图是几×几宫格（(1,1) 表示普通单码帧）。"""
+    try:
+        cols, rows = _grid_profiles(img)
+        nx, ny = _count_cells(cols), _count_cells(rows)
+        if not (1 <= nx <= 4 and 1 <= ny <= 4) or nx != ny:
+            # 行列不一致说明数岔了（水印、背景色、半透明蒙层），不敢相信
+            return 1, 1
+        return nx, ny
+    except Exception:  # noqa: BLE001  判断失败就老老实实整图识别
+        return 1, 1
+
+
+def _cut_points(spans, total_px: int, samples: int, slack: float = 0.06) -> list[tuple[float, float]]:
+    """把白缝换算成「每格占用的像素区间」。
+
+    ``slack`` 是格子两侧多留的比例 —— 屏幕上显示时可能带留白、轻微缩放或插值，
+    白缝边界未必正好是格子边界，往两边各多给一点，保证每张码在块里是完整的。
+    """
+    edges = [0.0]
+    for a, b in spans:
+        mid = (a + b) / 2.0
+        edges.append(mid * total_px / samples)
+    edges.append(float(total_px))
+    out = []
+    for k in range(len(edges) - 1):
+        lo, hi = edges[k], edges[k + 1]
+        pad = (hi - lo) * slack
+        out.append((max(0.0, lo - pad), min(float(total_px), hi + pad)))
+    return out
+
+
+def _tile_crops(img, nx: int, ny: int, slack: float = 0.06, spans=None):
+    """按 nx×ny 切块；给了白缝位置就按真实格子切，没给就等分。
+
+    等分在「图里只有动图本身」时没问题；真实截图里码外面还有桌面/窗口留白，
+    等分就会把格子切歪 —— 所以优先用白缝算出来的边界。
+    """
+    w, h = img.size
+    if spans:
+        xb = _cut_points(spans[0], w, 256, slack)
+        yb = _cut_points(spans[1], h, 256, slack)
+        if len(xb) != nx or len(yb) != ny:
+            xb = yb = None
+    else:
+        xb = yb = None
+    if xb is None:
+        cw, ch = w / nx, h / ny
+        ox, oy = cw * slack, ch * slack
+        xb = [(max(0, c * cw - ox), min(w, (c + 1) * cw + ox)) for c in range(nx)]
+        yb = [(max(0, r * ch - oy), min(h, (r + 1) * ch + oy)) for r in range(ny)]
+    out = []
+    for y0, y1 in yb:
+        for x0, x1 in xb:
+            box = (int(x0), int(y0), int(x1), int(y1))
+            if box[2] - box[0] >= 32 and box[3] - box[1] >= 32:
+                out.append(img.crop(box))
+    return out
+
+
+def _tile_pool():
+    """分块解码共用的线程池（zxing 解码时会释放 GIL，多线程是真并行）。
+
+    池子做到模块级：连拍时每秒要解十几帧，每次都新建线程池光调度就够呛。
+    """
+    global _TILE_POOL
+    if _TILE_POOL is None:
+        import atexit
+        from concurrent.futures import ThreadPoolExecutor
+
+        want = max(2, min(8, (os.cpu_count() or 4)))
+        _TILE_POOL = ThreadPoolExecutor(max_workers=want,
+                                        thread_name_prefix="opk-tile")
+        atexit.register(_TILE_POOL.shutdown, wait=False)
+    return _TILE_POOL
+
+
+def _read_matrix(img, fast: bool = False) -> list[str] | None:
+    """矩阵帧专用：切成 N² 块，多线程各解各的。
+
+    为什么值得这么做（实测 3×3、单张 2244²）：
+        整图一次 zxing          148ms
+        切 9 块、4 线程并行      38ms      —— 约 4 倍
+    zxing 在整图上找码要先做一次全图连通域分析，图越大越亏；切块后每块只有
+    1/9 大，而且天然互不干扰。
+
+    返回 ``None`` 表示「这不是矩阵帧」，调用方按原来的整图方式识别。
+    """
+    if img.width * img.height < GRID_PROBE_PIXELS:
+        return None
+    try:
+        cols, rows = _grid_profiles(img)
+    except Exception:  # noqa: BLE001
+        return None
+    xs, ys = _gap_spans(cols), _gap_spans(rows)
+    nx, ny = len(xs) + 1, len(ys) + 1
+    if nx != ny or not (2 <= nx <= 4):
+        return None
+    crops = _tile_crops(img, nx, ny, spans=(xs, ys))
+    if len(crops) <= 1:
+        return None
+    pool = _tile_pool()
+    got: list[str] = []
+    for part in pool.map(lambda t: _read_barcodes(t, fast=fast), crops):
+        got.extend(part)
+    if not got:
+        # 切块一张都没认出来 —— 多半是格子数判断错了（背景花纹、窗口边框也会
+        # 形成「贯穿整列的白条」）。交回给整图识别，宁可慢也不要漏。
+        return None
+    return _dedup(got)
+
+
 def _read_one(img, deep: bool = True, fast: bool = False, budget: float | None = None) -> list[str]:
     """识别一张（单帧）图里的所有码；识别不全就逐级加码重试。
 
@@ -868,7 +1295,10 @@ def _read_one(img, deep: bool = True, fast: bool = False, budget: float | None =
                          Image.LANCZOS)
 
     try:
-        texts = [r.text for r in zxingcpp.read_barcodes(img) if r.text]
+        # 大图先按矩阵帧试试：切块多线程比整图一次快 3~4 倍，命中不了再整图识别
+        texts = _read_matrix(img, fast=fast)
+        if texts is None:
+            texts = _read_barcodes(img, fast=fast)
     except Exception as exc:  # 损坏图片 / 不支持的格式
         raise QRError("二维码识别失败：%s" % exc) from None
     if fast:                      # 连拍模式：只认原图，交给调用方下一枪再试
@@ -894,7 +1324,7 @@ def _read_one(img, deep: bool = True, fast: bool = False, budget: float | None =
             if time.monotonic() > deadline:
                 return gained, True
             try:
-                found = [r.text for r in zxingcpp.read_barcodes(variant) if r.text]
+                found = _read_barcodes(variant)
             except Exception:  # noqa: BLE001  某个变体解不动不影响整体
                 continue
             fresh = [t for t in found if t not in seen]
@@ -974,17 +1404,37 @@ SCAN_RATE_MIN = 8
 
 
 def _frame_key(img) -> bytes | None:
-    """画面指纹：屏幕没变就不必重新解码，把时间省给下一帧。"""
+    """画面指纹：屏幕没变就不必重新解码，把时间省给下一帧。
+
+    先把图缩到 48×48 再算哈希：二维码换一帧，整片黑白格子全变，48×48 足够
+    分辨；而直接哈希 925×927×4 字节要 7~15ms，等于每枪白扔半帧的时间。
+    """
     import hashlib
 
+    from PIL import Image
+
     try:
-        return hashlib.blake2b(img.tobytes(), digest_size=16).digest()
+        small = img if max(img.size) <= 96 else img.resize((48, 48), Image.BILINEAR)
+        return hashlib.blake2b(small.tobytes(), digest_size=16).digest()
     except Exception:  # noqa: BLE001  取不到就不去重
         return None
 
 
+def _resume_idle(need: int | None, fps: float, idle: float) -> float:
+    """续扫（补录）时「多久没有新帧才判死」：够播**一整轮**，最长 240 秒。
+
+    为什么不能沿用第一轮的 3 秒：补录时画面可能正播在中段，等首帧标识要等半圈。
+    用户点了「再来一轮」看到「3.2 秒 / 0 轮 / 新收 0 帧」，等于根本不给机会。
+    """
+    if not need:
+        return idle
+    loop_est = need / max(0.5, float(fps))
+    return max(idle, min(loop_est + 10.0, 240.0))
+
+
 def _adaptive_cap(cap: float, need: int | None, fps: float,
-                  got: int = 0, span: float = 0.0) -> float:
+                  got: int = 0, span: float = 0.0,
+                  recent: float | None = None) -> float:
     """按总帧数放宽连拍上限。
 
     978 帧的动图按 3 帧/秒播一轮要 **326 秒**，而默认上限只有 30 秒 ——
@@ -1002,16 +1452,38 @@ def _adaptive_cap(cap: float, need: int | None, fps: float,
     # 下一轮的机会 —— 真收完了会靠「连续两轮没有新帧」提前退出，不会真跑满。
     guess = need / max(0.5, float(fps)) * 2.5 + 15.0
     if got >= SCAN_RATE_MIN and span > 0:
-        eta = need / max(0.2, got / span) * 1.15 + 15.0
+        # 用最近几秒的真实速度；播放慢下来时上限要跟着放，否则会被自己掐断
+        rate = recent if (recent and recent > 0) else got / span
+        eta = need / max(0.2, rate) * 1.15 + 15.0
         guess = max(guess, min(eta, need * 2.5))   # 最慢按 0.4 帧/秒兜底
     return min(SCAN_CAP_MAX, max(cap, guess))
 
 
-def _eta(need: int | None, got: int, span: float) -> float | None:
-    """还要多久收齐（秒）。按实测收帧速度推；样本太少就返回 None。"""
+def _eta(need: int | None, got: int, span: float,
+         recent: float | None = None) -> float | None:
+    """还要多久收齐（秒）。优先按**最近**几秒的收帧速度推，样本太少返回 None。
+
+    为什么不用累计平均：播放器一开始能跑十几帧/秒，播到后面会掉下来（解码
+    缓存耗尽、GIF 重排）。实测一次 420 帧的扫描：前 20 秒按累计平均算出「还要
+    9 秒」，之后整整又跑了 90 秒 —— 累计平均被开头那一段带偏了。最近 6 秒的
+    速率才跟得上当下的真实进度。
+    """
     if not need or got < SCAN_RATE_MIN or span <= 0 or got >= need:
         return None
-    return max(0.0, (need - got) / max(0.2, got / span))
+    rate = recent if (recent and recent > 0) else got / span
+    return max(0.0, (need - got) / max(0.2, rate))
+
+
+def _recent_rate(samples: list[tuple[float, int]]) -> float | None:
+    """最近约 6 秒的收帧速度（帧/秒）；窗口太短给不出可信值就返回 None。"""
+    if len(samples) < 2:
+        return None
+    t0, n0 = samples[0]
+    t1, n1 = samples[-1]
+    dt = t1 - t0
+    if dt < 1.5:
+        return None
+    return max(0.0, (n1 - n0) / dt)
 
 
 def _total_frames(texts: Sequence[str]) -> int | None:
@@ -1025,9 +1497,255 @@ def _total_frames(texts: Sequence[str]) -> int | None:
     return max(seg.total for seg in segs)
 
 
+#: 相位搜索网格：把「一齿」（一个采样周期）切成 24 份去找最优平移量。
+#: 再细下去收益只有百分之几，但每次扫描结束都要跑一遍模拟，24 份够用。
+PHASE_GRID = 24
+
+#: 抖动最多补几轮。每多一轮都要重播一整圈，6 轮（2^5=32 倍细分）之后收益
+#: 已经低于「干脆把采样帧率提上去」。
+JITTER_ROUNDS_MAX = 6
+
+
+def segment_index(text: str) -> int | None:
+    """只读段头拿帧序号（不解析正文）—— 收帧时要给每一帧记时间戳。
+
+    整段 ``parse_segments`` 一次要扫几千字的正文，收帧热路径上用不起；
+    段头固定在头一行，所以只切一行、只切一次（``splitlines()`` 会为整段
+    正文造一个几十行的列表，几千帧累下来是白费的内存和 CPU）。
+    """
+    head = text.partition("\n")[0].strip()
+    if not head.startswith(ct.SEG_PREFIX):
+        return None
+    fields = head.split()
+    if len(fields) < 3 or "/" not in fields[2]:
+        return None
+    try:
+        return int(fields[2].split("/", 1)[0])
+    except ValueError:
+        return None
+
+
+def _van_der_corput(n: int) -> float:
+    """二进制 van der Corput 序列第 n 项：0, 1/2, 1/4, 3/4, 1/8, 5/8, 3/8, 7/8 …
+
+    这就是「每轮往后挪多少相位」的答案：每新的一项都落在**现存最大空隙的正
+    中间**，把最宽的那段缺口对半劈开。比随机抖动强在**确定性**：R 轮之后
+    剩余最大缺口是首轮的 1/2^R，不会像随机那样靠运气（随机抽签要凑齐 N 个，
+    期望 N·lnN 次）。
+    """
+    value, denom = 0.0, 1.0
+    while n > 0:
+        n, rem = divmod(n, 2)
+        denom *= 2.0
+        value += rem / denom
+    return value
+
+
+def frame_gaps(texts: Sequence[str]) -> dict:
+    """算「还缺哪些帧、最大的一段连缺多宽」。
+
+    缺口按**环形**算：动图是循环播放的，最后一帧和第一帧之间也算一段缺口 ——
+    少了这一笔，缺的正好是跨环那几帧时会算成「没有缺口」。
+    """
+    try:
+        segs = ct.parse_segments("\n".join(texts))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not segs:
+        return {}
+    need: dict[str, int] = {}
+    got: dict[str, set[int]] = {}
+    for seg in segs:
+        need[seg.doc_id] = seg.total
+        got.setdefault(seg.doc_id, set()).add(seg.index)
+    total = 0
+    missing: list[int] = []
+    max_gap = 0
+    for doc_id, n in need.items():
+        have = sorted(i for i in got.get(doc_id, ()) if 1 <= i <= n)
+        total += n
+        have_set = set(have)
+        missing.extend(i for i in range(1, n + 1) if i not in have_set)
+        if not have:
+            max_gap = max(max_gap, n)
+            continue
+        for a, b in zip(have, have[1:]):
+            max_gap = max(max_gap, b - a - 1)
+        if len(have) < n:
+            # 跨环缺口：末尾之后接回开头
+            max_gap = max(max_gap, (have[0] - 1) + (n - have[-1]))
+    return {"total": total, "got": total - len(missing),
+            "missing": missing, "max_gap": max_gap}
+
+
+def _coverage(n: int, step: float, samples: int, ratio: float) -> set[int]:
+    """模拟一轮采样会收到哪些帧号（理想梳齿模型）。
+
+    采样时刻（单位=帧）是 ``(k + ratio) * step``，画面上的帧号就是它的整数
+    部分取模。``step`` 是「两枪之间画面往前走了几帧」= 播放帧率 ÷ 采样帧率。
+    """
+    if n <= 0:
+        return set()
+    if step <= 0:
+        return {1}
+    out = set()
+    for k in range(max(1, samples)):
+        out.add(int((k + ratio) * step) % n + 1)
+    return out
+
+
+def _player_fps(samples: Sequence[tuple[float, int]]) -> float | None:
+    """从「(收到时刻, 帧序号)」估播放器的实际帧率。
+
+    两枪之间画面前进了几个序号、花了多少秒，比值就是播放帧率。只取序号
+    **前进**的样本（跳帧 / 回绕会给出负数），间隔太短的丢掉（抓图抖动会把
+    比值放大几十倍），最后取中位数抗个别跳变。
+    """
+    rates = []
+    for (t0, i0), (t1, i1) in zip(samples, samples[1:]):
+        d, dt = i1 - i0, t1 - t0
+        if d <= 0 or dt < 0.05:
+            continue
+        rates.append(d / dt)
+    if len(rates) < 2:
+        # 一个比值都可能被单帧解码失败带偏，至少要两个才敢取中位数。
+        return None
+    rates.sort()
+    return rates[len(rates) // 2]
+
+
+def plan_jitter(texts: Sequence[str], sample_fps: float = 0.0,
+                player_fps: float | None = None, rounds_done: int = 1) -> dict:
+    """算「下一轮把采样相位挪几帧收益最大」和「一共要几轮才能收齐」。
+
+    做法是一个很小的最优化：把一齿切成 ``PHASE_GRID`` 份，逐份模拟「挪到这里
+    能多收多少帧」，取收益最大的那份；再一直模拟到收齐，同时得到总轮数。
+
+    三个结论先说在前面：
+
+    * **步长才是主因**。``step = 播放帧率 ÷ 采样帧率``。step > 1 时一轮最多
+      只能收到 ``1/step`` 的帧，**再高明的抖动也只是把漏的换一批**，真正省
+      时间的是把采样帧率提上去（提到播放帧率的 1.2 倍就一轮收齐）。
+    * step ≈ 1（最常见：播放器 10 帧/秒、程序 10 枪/秒）时一轮该齐，缺的那
+      几帧是解码失手，抖半个齿就能补上。
+    * 真要靠多轮补，每轮往后挪 ``1/2, 1/4, 3/4, 1/8 …``（二分序列）比随机
+      抖动快，因为它是**确定的**：R 轮后最大缺口缩到 1/2^R 齿。
+
+    返回 ``{"step", "samples", "rounds_left", "total_rounds", "next_ratio",
+    "next_frames", "max_gap", "missing", "advice"}``；没有段头时返回空 dict。
+    """
+    import math
+
+    gaps = frame_gaps(texts)
+    if not gaps:
+        return {}
+    n = gaps["total"]
+    missing = len(gaps["missing"])
+    max_gap = gaps["max_gap"]
+    out = {"total": n, "missing": missing, "max_gap": max_gap,
+           "step": None, "samples": 0, "rounds_left": 0, "total_rounds": 0,
+           "next_ratio": 0.5, "next_frames": None, "advice": ""}
+    if missing <= 0:
+        out["advice"] = "已经收齐了"
+        return out
+
+    step = None
+    if player_fps and sample_fps and sample_fps > 0:
+        step = max(0.05, float(player_fps) / float(sample_fps))
+        out["step"] = round(step, 3)
+
+    if step is None:
+        # 测不出播放帧率（慢速播放 / 样本太少）：退回「每轮把最大缺口劈半」。
+        # ceil(log2(gap)) 轮之后最大缺口 < 1 帧 —— 每帧的显示窗口里至少落进一枪。
+        rounds = max(1, int(math.ceil(math.log2(max(2, max_gap)))))
+        out.update(rounds_left=min(rounds, JITTER_ROUNDS_MAX),
+                   total_rounds=rounds_done + min(rounds, JITTER_ROUNDS_MAX),
+                   next_frames=None)
+        out["advice"] = ("测不出播放帧率，按最大连缺 %d 帧估：每轮把缺口劈半，"
+                         "大约再 %d 轮" % (max_gap, out["rounds_left"]))
+        return out
+
+    # 一轮的采样数：够铺满整圈（N/step 枪），再多两枪防边界
+    samples = min(int(math.ceil(n / max(0.05, step))) + 2, 20000)
+    out["samples"] = samples
+
+    got = {i for i in range(1, n + 1)} - set(gaps["missing"])
+
+    plan: list[dict] = []
+    covered = set(got)
+    for _ in range(JITTER_ROUNDS_MAX):
+        if len(covered) >= n:
+            break
+        best_gain, best_ratio, best_cov = -1, 0.5, set()
+        for j in range(PHASE_GRID):
+            ratio = j / PHASE_GRID
+            cov = _coverage(n, step, samples, ratio)
+            gain = len(cov - covered)
+            # 收益一样时取**离 0.5 最近**的那个相位：现实里的步长不会正好是
+            # 整数（播放器帧时长有抖动），半个齿的错位最不容易和上一轮重合。
+            if (gain, -abs(ratio - 0.5)) > (best_gain, -abs(best_ratio - 0.5)):
+                best_gain, best_ratio, best_cov = gain, ratio, cov
+        if best_gain <= 0:
+            break
+        covered |= best_cov
+        plan.append({"ratio": best_ratio,
+                     "frames": round(best_ratio * step, 2),
+                     "gain": best_gain})
+
+    rounds_left = 0 if len(covered) >= n else max(1, JITTER_ROUNDS_MAX)
+    if plan:
+        rounds_left = len(plan)
+    out.update(rounds_left=rounds_left, total_rounds=rounds_done + rounds_left,
+               next_ratio=plan[0]["ratio"] if plan else 0.5,
+               next_frames=plan[0]["frames"] if plan else None)
+
+    # ---- 最快路线：比的是**总耗时**，不是轮数 ----
+    # 每一轮都得让动图走完一整圈（缺的帧可能在任何位置），所以
+    #   补轮路线耗时 ≈ 轮数 × 一圈时长
+    #   提枪速路线耗时 ≈ 一圈时长（枪速 > 播放率时一轮之内就能扫完）
+    # 轮数 ≥ 2 时提枪速必然更快，直接给数字，别让用户一轮一轮试。
+    loop_sec = n / max(0.5, float(player_fps)) if player_fps else 0.0
+    target_fps = float(player_fps) * 1.2 if player_fps else None
+    out["loop_sec"] = round(loop_sec, 1)
+    out["target_fps"] = round(target_fps, 1) if target_fps else None
+    out["round_cost"] = round(rounds_left * loop_sec, 1) if loop_sec else None
+    if rounds_left <= 1:
+        out["fastest"] = "one_more_round"
+        out["fastest_sec"] = round(loop_sec, 1) if loop_sec else None
+    else:
+        out["fastest"] = "raise_fps"
+        out["fastest_sec"] = round(loop_sec * 1.05, 1) if loop_sec else None
+
+    if rounds_left <= 1 and plan:
+        out["advice"] = (
+            "最快就是再一轮：相位挪 %.2f 个周期（约 %.1f 帧，二分序列的 1/%d），"
+            "约 %.0f 秒收齐 —— 这已经是最省时间的一档，提帧率不会更快"
+            % (plan[0]["ratio"], plan[0]["frames"],
+               int(round(1.0 / max(0.04, plan[0]["ratio"]))),
+               out["fastest_sec"] or 0))
+    elif plan and step > 1.05:
+        out["advice"] = (
+            "步长 %.2f（采样比播放慢），补轮要 %d 轮 ≈ %.0f 秒；"
+            "最快是把「动图帧率」提到 %d 帧/秒，一轮 ≈ %.0f 秒就齐，快 %.1f 倍"
+            % (step, rounds_left, out["round_cost"] or 0,
+               int(math.ceil(target_fps or 12)), out["fastest_sec"] or 0,
+               (rounds_left * loop_sec) / max(0.1, loop_sec * 1.05) if loop_sec else 1.0))
+    elif plan:
+        out["advice"] = (
+            "最大连缺 %d 帧 → 下一轮采样相位挪 %.2f 个周期（约 %.1f 帧，"
+            "即二分序列的 1/%d），按此节奏再 %d 轮可收齐（共 %d 轮）"
+            % (max_gap, plan[0]["ratio"], plan[0]["frames"],
+               int(round(1.0 / max(0.04, plan[0]["ratio"]))),
+               rounds_left, rounds_done + rounds_left))
+    else:
+        out["advice"] = "缺口大到模拟都补不上，建议提高采样帧率"
+    return out
+
+
 def scan_region(grab, idle: float | None = None, cap: float | None = None,
                 interval: float | None = None, on_progress=None,
-                should_stop=None, frames_per_sec: float = 3.0
+                should_stop=None, frames_per_sec: float = 3.0, known=None,
+                phase_ratio: float = 0.0
                 ) -> tuple[list[str], dict]:
     """对着同一块屏幕区域连续抓图，把动图里一帧帧的码全收下来。
 
@@ -1055,8 +1773,12 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
 
     ``grab()`` 由调用方提供（返回 PIL.Image），本模块不碰屏幕，便于测试。
 
+    ``known`` 是**之前几轮已经收到的帧**：续扫时传进来，就只补没收到的那几帧 ——
+    已收的不会重复计数、也不会因为「这一轮没收全」而白扫一整轮。收齐立刻停。
+
     返回 ``(texts, stats)``，texts 不含标识帧；stats 含
-    ``shots / frames / cycles / complete / elapsed / need``。
+    ``shots / frames / cycles / complete / elapsed / need``，其中 ``frames`` 是
+    **累计**帧数，``fresh`` 是本轮新收的帧数。
     """
     import time
 
@@ -1068,10 +1790,24 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
         # 不加间隔也有 16 枪/秒 —— 10 帧/秒的动图采得到 1.6 倍，够用。
         interval = 0.0
 
+    # 「续扫」和「第一轮」是两种完全不同的判死标准。
+    # 第一轮画面从哪儿开始播都不知道，但很快能见到首帧标识；续扫时画面可能正播在
+    # 中段，等首帧标识要等**半轮**——之前按 3 秒判死，用户点「再来一轮」看到的就是
+    # 「3.2 秒 / 0 轮 / 新收 0 帧」，等于根本不给机会。所以续扫时把判死时间放到
+    # 「够播一整轮」（按标称帧率算，播放器更快时自然更早见到标识帧）。
+    resume = bool(known)
+    resumed_need = _total_frames(known) if known else None
+
+    def _idle_limit() -> float:
+        if not resume:
+            return idle
+        return _resume_idle(resumed_need, frames_per_sec, idle)
+
     started = time.monotonic()
     last_new = started
-    texts: list[str] = []
-    seen: set[str] = set()
+    texts: list[str] = list(known or [])      # 累计（含之前几轮收到的）
+    seen: set[str] = set(texts)
+    base = len(texts)                          # 续扫前的基数，用来算「本轮补了几帧」
     shots = 0
     complete = False
     last_img = None
@@ -1080,91 +1816,213 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
     progress_cycle = 0    # 最近一次收到新帧时的轮次
     saw_end = False
     marked = False
-    need = None           # 文档总帧数（收到第一帧后从段头读出来）
+    #: 采样时基。见到首帧标识 ``S`` 就把**那一枪的时刻**记成相位 0 点，之后每
+    #: 转一圈（再见到 S）把采样网格整体平移一个相位 —— 见 ``_van_der_corput``。
+    #: 没有这个 0 点，「每轮往后挪多少」就没有参照，挪了也白挪。
+    anchor_t: float | None = None
+    tick = 0              # 锚点之后第几枪
+    phase = float(phase_ratio) % 1.0
+    #: 本圈的采样周期。每圈抖 ±2%：步长不是整数时（如 3.33），采样点会在
+    #: 「10 帧一轮、3 枪一循环」的**格点**上打转，残留的那几帧永远落不到格子
+    #: 上 —— 实测补 5 轮都卡在 22/24。周期缓慢漂一点，格子就会碾过所有相位。
+    cycle_dt = interval
+    #: (收到时刻, 帧序号)：用来估播放器实际帧率，进而算出采样步长 step。
+    frame_log: list[tuple[float, int]] = []
+    # 总帧数：续扫时一开始就知道，不用等第一帧
+    need = _total_frames(texts) if texts else None
+    if need:
+        cap = _adaptive_cap(cap, need, frames_per_sec)
     first_new = None      # 第一帧到手的时间，用来量「实测收帧速度」
+    #: (时刻, 累计帧数) 的滑动窗口，用来算「最近几秒真实收得多快」。
+    #: 播放器越放越慢，累计平均会被开头那一段带偏（实测差出 10 倍）。
+    rate_win: list[tuple[float, int]] = []
 
-    while True:
-        now = time.monotonic()
-        if (now - started) >= cap:
-            break
-        if marked:
-            # 有标识帧：按轮次算，连续两轮颗粒无收才放弃（期间画面继续播）
-            if saw_end and starts - progress_cycle >= 2:
-                break
-            # 尾帧一直没被认出来、或者播放器暂停/缓冲/被切走：给足时间再判死
-            if (now - last_new) >= max(idle * 2, SCAN_STALL):
-                break
-        elif (now - last_new) >= idle:
-            break
-        # 连开几枪一张码都没见着：多半框错了地方，赶紧转全力重试，别干等
-        if not texts and shots >= SCAN_EMPTY_SHOTS:
-            break
-        if should_stop is not None and should_stop():
-            break
+    if texts and _looks_complete(texts):
+        # 上次其实已经收齐了（只是没来得及还原）：一枪都不用开
+        return texts, {"shots": 0, "frames": len(texts), "fresh": 0, "cycles": 0,
+                       "complete": True, "elapsed": 0.0, "need": need, "cap": cap,
+                       "image": None}
+
+    # 抓屏已经挪进后台线程（见 ``screengrab.Prefetcher``），抓图 17~35ms、解码
+    # 55~80ms，解码成了唯一的瓶颈。zxing 读码时**会释放 GIL**（实测 8 线程
+    # 37.3ms → 10.7ms），所以线程数比核数多开几个才有意义：4 个线程撑得住
+    # 13 枪/秒，8 个才跟得上后台抓屏。
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = max(1, min(8, os.cpu_count() or 2))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    #: 已提交、还没回收的解码任务，每项 ``(future, 抓这一枪的时刻)``。
+    #: 带上抓图时刻是为了给首帧标识一个**准确**的相位 0 点：解码是异步的，
+    #: 等解码完再记时刻，晚了 40~80ms，刚好是半个采样周期，相位就废了。
+    inflight: list = []
+
+    def _decode_shot(image, shot_no):
         try:
-            img = grab()
-        except Exception:  # noqa: BLE001  切桌面/锁屏导致的偶发抓图失败不该中断
-            img = None
-        shots += 1
-        if img is not None:
-            key = _frame_key(img)
-            if key is None or key != last_key:      # 画面变了才解码
-                last_key = key
-                last_img = img
-                try:
-                    found = decode_image(img, fast=True, keep_markers=True)
-                except Exception:  # noqa: BLE001
-                    found = []
-                if not found and not texts and shots <= 3:
-                    # 裸读一枪没中：屏幕上显示的码经过缩放插值（125% 缩放 = 双线性
-                    # 拉伸），往往就差一口气。前几枪换便宜的重试再来一次
-                    # （阈值/放大/切块），别坐等到收工才拿最后一帧深挖 ——
-                    # 静态画面下画面不变就不会再解码，第一次失手等于永久漏帧。
+            got = decode_image(image, fast=True, keep_markers=True)
+        except Exception:  # noqa: BLE001  单枪解码失败不该中断连拍
+            got = []
+        if not got and not texts and shot_no <= 3:
+            # 裸读一枪没中：屏幕上显示的码经过缩放插值（125% 缩放 = 双线性
+            # 拉伸），往往就差一口气。前几枪换便宜的重试再来一次
+            # （阈值/放大/切块），别坐等到收工才拿最后一帧深挖 ——
+            # 静态画面下画面不变就不会再解码，第一次失手等于永久漏帧。
+            try:
+                got = _read_one(image, deep=False)
+            except Exception:  # noqa: BLE001
+                got = []
+        return got
+
+    try:
+        while True:
+            now = time.monotonic()
+            if (now - started) >= cap:
+                break
+            if marked:
+                # 有标识帧：按轮次算，连续两轮颗粒无收才放弃（期间画面继续播）
+                if saw_end and starts - progress_cycle >= 2:
+                    break
+                # 尾帧一直没被认出来、或者播放器暂停/缓冲/被切走：给足时间再判死
+                if (now - last_new) >= max(max(idle * 2, SCAN_STALL), _idle_limit()):
+                    break
+            elif (now - last_new) >= _idle_limit():
+                break
+            # 连开几枪一张码都没见着：多半框错了地方，赶紧转全力重试，别干等
+            if not texts and shots >= SCAN_EMPTY_SHOTS:
+                break
+            if should_stop is not None and should_stop():
+                break
+            try:
+                img = grab()
+            except Exception:  # noqa: BLE001  切桌面/锁屏导致的偶发抓图失败不该中断
+                img = None
+            shots += 1
+            shot_t = time.monotonic()
+            if img is not None:
+                key = _frame_key(img)
+                if key is None or key != last_key:      # 画面变了才解码
+                    last_key = key
+                    last_img = img
+                    inflight.append((pool.submit(_decode_shot, img, shots), shot_t))
+                    # 解码跟不上时就别把帧堆起来占内存（一帧 922×925 约 2.5MB）
+                    while len(inflight) > workers * 3:
+                        inflight.pop(0)[0].cancel()
+
+            # 回收已解完的（可能是这一枪、也可能是前几枪提交的，帧自带序号，顺序无所谓）
+            # 跑两轮：第一轮收现成的；还一帧都没读到时就等一下这一枪的结果 ——
+            # 静态码本来第一枪就该齐，不能为了「异步」让它多抓两枪。
+            for _round in range(2):
+                for item in [it for it in inflight if it[0].done()]:
+                    inflight.remove(item)
+                    fut, fut_t = item
                     try:
-                        found = _read_one(img, deep=False)
+                        found = fut.result()
                     except Exception:  # noqa: BLE001
                         found = []
-                data: list[str] = []
-                for text in found:
-                    mk = parse_marker(text)
-                    if mk is None:
-                        data.append(text)
-                        continue
-                    marked = True
-                    if mk[0] == "S":
-                        starts += 1
-                    elif mk[0] == "E":
-                        saw_end = True
-                fresh = [t for t in data if t not in seen]
-                if fresh:
-                    seen.update(fresh)
-                    texts.extend(fresh)
-                    last_new = time.monotonic()
-                    if first_new is None:
-                        first_new = last_new
-                    if starts:
-                        progress_cycle = starts
-                    if need is None:
-                        # 收到第一帧就知道这份文件一共多少帧了 —— 978 帧按 3 帧/秒
-                        # 播一轮要 326 秒，卡 30 秒上限永远只能收一小半。
-                        need = _total_frames(texts)
-                    # 边收边续命：播放比预期慢就自动把上限往后放
-                    cap = _adaptive_cap(cap, need, frames_per_sec,
-                                        len(texts), last_new - first_new)
+                    data: list[str] = []
+                    for text in found:
+                        mk = parse_marker(text)
+                        if mk is None:
+                            data.append(text)
+                            continue
+                        marked = True
+                        if mk[0] == "S":
+                            starts += 1
+                            # 新的一圈开始了：把采样网格整体平移一个相位。
+                            # 第一圈不动（phase_ratio 原样），之后按二分序列
+                            # 0.5 / 0.25 / 0.75 … 逐圈把缺口劈半。
+                            anchor_t = fut_t
+                            tick = 0
+                            if starts > 1:
+                                phase = (float(phase_ratio)
+                                         + _van_der_corput(starts - 1)) % 1.0
+                            cycle_dt = interval * random.uniform(0.98, 1.02)
+                        elif mk[0] == "E":
+                            saw_end = True
+                    fresh = [t for t in data if t not in seen]
+                    if fresh:
+                        seen.update(fresh)
+                        texts.extend(fresh)
+                        last_new = time.monotonic()
+                        for text in fresh:
+                            idx = segment_index(text)
+                            if idx is not None:
+                                frame_log.append((last_new, idx))
+                        if first_new is None:
+                            first_new = last_new
+                        if starts:
+                            progress_cycle = starts
+                        if need is None:
+                            # 收到第一帧就知道这份文件一共多少帧了 —— 978 帧按 3 帧/秒
+                            # 播一轮要 326 秒，卡 30 秒上限永远只能收一小半。
+                            need = _total_frames(texts)
+                        # 边收边续命：播放比预期慢就自动把上限往后放。
+                        # 只用**本轮**收的帧量速度，续扫的基数不算进去。
+                        rate_win.append((last_new, len(texts)))
+                        while len(rate_win) > 2 and last_new - rate_win[0][0] > 6.0:
+                            rate_win.pop(0)
+                        cap = _adaptive_cap(cap, need, frames_per_sec,
+                                            len(texts) - base, last_new - first_new,
+                                            recent=_recent_rate(rate_win))
                 if texts and _looks_complete(texts):
                     complete = True
+                if complete:
                     break
-        if on_progress is not None:
-            span = (time.monotonic() - first_new) if first_new else 0.0
-            try:
-                on_progress({"shots": shots, "frames": len(texts), "cycles": starts,
-                             "elapsed": time.monotonic() - started,
-                             "complete": complete, "need": need,
-                             # 「还要多久收齐」——不然只能看着帧数一点点涨干等
-                             "eta": _eta(need, len(texts), span)})
-            except Exception:  # noqa: BLE001  回调出错不能拖垮识别
-                pass
-        time.sleep(interval)
+                if texts or not inflight:
+                    break
+                # 还一帧都没读到：等这一枪解码完再判一次，别为「异步」多抓两枪；
+                # 等不到（解码太慢）就走下一轮继续抓图。
+                try:
+                    inflight[0][0].result(timeout=0.6)
+                except Exception:  # noqa: BLE001
+                    break
+            if complete:
+                break
+            if on_progress is not None:
+                span = (time.monotonic() - first_new) if first_new else 0.0
+                if first_new is not None:
+                    now_t = time.monotonic()
+                    rate_win.append((now_t, len(texts)))
+                    while len(rate_win) > 2 and now_t - rate_win[0][0] > 6.0:
+                        rate_win.pop(0)
+                try:
+                    on_progress({"shots": shots, "frames": len(texts), "cycles": starts,
+                                 "elapsed": time.monotonic() - started,
+                                 "complete": complete, "need": need,
+                                 "fresh": len(texts) - base,
+                                 # 「还要多久收齐」——不然只能看着帧数一点点涨干等
+                                 "eta": _eta(need, len(texts), span,
+                                             recent=_recent_rate(rate_win))})
+                except Exception:  # noqa: BLE001  回调出错不能拖垮识别
+                    pass
+            # 采样节拍。以前这里只是「睡 interval 秒 + ±25% 随机抖动」，问题是
+            # 每枪的相位没有参照物 —— 播放周期和采样周期一旦成整比，就会**每轮
+            # 稳定地漏同几帧**（实测 3823 帧里固定缺 340–343、844–847 这几段，
+            # 补录几轮都补不上）。
+            #
+            # 现在改成**绝对时基**：以见到首帧标识 S 的那一枪为相位 0 点，每枪
+            # 的目标时刻 = 锚点 + (第几枪 + 相位) × interval。相位按二分序列
+            # 0 / 1/2 / 1/4 / 3/4 … 逐圈平移，每圈都落在上一圈缺口正中间，
+            # R 圈之后最大缺口缩到 1/2^R 齿 —— 这是「每轮挪多少收益最大」的答案。
+            if interval <= 0:
+                # 帧率高到不需要人为间隔：采样已经是「尽力而为」，相位由抓图
+                # 速度决定，没必要也没法控制。
+                time.sleep(random.uniform(0.0, 0.006))
+            elif anchor_t is None:
+                # 还没见到首帧标识：没有相位参照，只能先按固定间隔走。
+                time.sleep(interval * random.uniform(0.85, 1.15))
+            else:
+                tick += 1
+                target = anchor_t + (tick + phase) * cycle_dt
+                delay = target - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                elif delay < -2.5 * cycle_dt:
+                    # 处理速度跟不上（解码慢了 / 系统卡了）：时基已经彻底失效，
+                    # 再"补课"只会连甩几十枪。把锚点挪到现在重新对齐，保住相位。
+                    anchor_t = time.monotonic()
+                    tick = 0
+    finally:
+        pool.shutdown(wait=False)
 
     # 便宜的连拍认不出来（码小、有水印、压缩噪点），拿最后一张图做一次全力重试
     if last_img is not None and not complete:
@@ -1178,9 +2036,22 @@ def scan_region(grab, idle: float | None = None, cap: float | None = None,
             texts.extend(fresh)
             complete = _looks_complete(texts)
 
-    return texts, {"shots": shots, "frames": len(texts), "cycles": starts,
-                   "complete": complete, "elapsed": time.monotonic() - started,
+    elapsed = time.monotonic() - started
+    fps_play = _player_fps(frame_log)
+    gaps = frame_gaps(texts)
+    # 采样步长 = 播放帧率 ÷ 实际枪速。「两枪之间画面往前走了几帧」就是这个数 ——
+    # 大于 1 就注定漏帧，再高明的抖动也只能换一批漏，真正管用的是把枪速提上去。
+    plan = plan_jitter(texts,
+                       sample_fps=(shots / elapsed) if elapsed > 0.3 else 0.0,
+                       player_fps=fps_play,
+                       rounds_done=max(1, starts or 1))
+    return texts, {"shots": shots, "frames": len(texts), "fresh": len(texts) - base,
+                   "cycles": starts,
+                   "complete": complete, "elapsed": elapsed,
                    "need": need, "cap": cap,
+                   # 实测播放帧率 / 缺口 / 抖动建议：给调用方打印「下一轮挪多少、
+                   # 一共还要几轮」，用户不用自己猜该点几次「再来一轮」。
+                   "player_fps": fps_play, "gaps": gaps, "jitter": plan,
                    # 最后一枪的画面：一无所获时调用方可以存下来，让「识别不了」
                    # 有据可查 —— 光靠嘴说定位不了是码太糊、框错地方还是被窗口挡了。
                    "image": last_img}

@@ -235,6 +235,26 @@ class ScanRegionTest(unittest.TestCase):
         with open(results[0][0], "rb") as fh:
             self.assertEqual(fh.read(), self.raw)
 
+    def test_resume_only_fills_missing_frames(self):
+        """续收：把已收的帧传进去，只补缺的那几帧，补到就停。
+
+        用户的原话：「只需要补充未收录的帧就是」。所以 ``known`` 里的帧必须
+        直接算进已收，不能从头再数一遍，也不能因为「这一轮没走完」而白扫。
+        """
+        texts, stats = qr.scan_region(self._cycler(self.images),
+                                      idle=0.5, interval=0.0, cap=30)
+        self.assertTrue(stats["complete"], "第一次就没收齐，测不出续收")
+        seed = list(texts)
+        seed.pop(len(seed) // 2)           # 模拟上一轮漏了一帧
+
+        got, again = qr.scan_region(self._cycler(self.images), idle=0.5,
+                                    interval=0.0, cap=30, known=seed)
+        self.assertTrue(again["complete"], "续收应当补齐并判成收齐")
+        self.assertEqual(len(got), len(texts), "续收后帧数应当回到全量")
+        self.assertLessEqual(again["fresh"], 2,
+                             "续收只该补那一帧，不该把整轮重收一遍（fresh=%d）"
+                             % again["fresh"])
+
     def test_static_code_returns_immediately(self):
         """完整单码：第一枪就齐，不该傻等 idle 秒（否则每次框选都卡 2 秒）。"""
         raw = b"officepack one frame sample" * 2
@@ -285,7 +305,10 @@ class ScanRegionTest(unittest.TestCase):
         self.assertTrue(stats["complete"], "一轮没收齐：%r" % (stats,))
         self.assertEqual(len(texts), len(self.frames))
         self.assertFalse([t for t in texts if qr.is_marker(t)], "标识帧混进了数据")
-        self.assertLessEqual(stats["cycles"], 1, "本该一轮收齐")
+        # 一轮收齐是目标，但解码是异步的（多线程并行），机器同时跑别的活时
+        # 可能晚一轮才收到尾帧 —— 那也远好过「卡到超时」。这里只拦「磨到超时」。
+        self.assertLessEqual(stats["cycles"], 2, "本该一两轮收齐，不该磨下去")
+        self.assertLess(stats["elapsed"], 5.0, "收齐得太慢，像是在等超时")
 
     def test_blank_region_gives_up_quickly(self):
         """框错了地方：不能磨很久，也不能抛异常。"""
@@ -323,6 +346,92 @@ class ScanRegionTest(unittest.TestCase):
         self.assertTrue(texts, "快扫失手后没有重试，等于永久漏帧")
         self.assertLessEqual(calls["n"], 3, "重试次数失控，动图会被拖慢")
         self.assertLessEqual(stats["shots"], 4, "不是在前几枪就补救的")
+
+
+class MatrixFrameTest(unittest.TestCase):
+    """矩阵动图：9 张码拼成 3×3 一张大图，帧数降到 1/9，识别端要能一块不落。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.frames, cls.raw = _make_frames(20000)
+
+    def test_matrix_shrinks_frame_count(self):
+        n = len(self.frames) + 2                       # 首尾标识帧
+        base = list(qr.anim_images(self.frames, "M", 480, markers=True,
+                                   matrix=1))[0].width
+        for side in (1, 2, 3):
+            imgs = list(qr.anim_images(self.frames, "M", 480, markers=True,
+                                       matrix=side))
+            want = -(-n // (side * side))
+            self.assertEqual(len(imgs), want,
+                             "%d×%d 应该拼成 %d 张" % (side, side, want))
+            # 拼图边长 = 每格宽 × N + 格间白缝
+            self.assertEqual(imgs[0].width, base * side + 12 * (side - 1),
+                             "%d×%d 的拼图尺寸不对" % (side, side))
+
+    def test_grid_side_detects_layout(self):
+        for side in (1, 2, 3):
+            imgs = list(qr.anim_images(self.frames, "M", 480, markers=True,
+                                       matrix=side))
+            got = qr._grid_side(imgs[0].convert("RGB"))
+            self.assertEqual(got, (side, side),
+                             "%d×%d 的图被判成了 %r" % (side, side, got))
+
+    def test_partial_last_tile_still_decodes(self):
+        """最后一宫格凑不满 9 张（除余）也要一帧不落地解出来。
+
+        用户问「总帧数不是 9 的倍数时，最后那格怎么办」：生成时补白到满格，
+        识别端只认实际存在的码。这里用 17 帧数据（+2 标识 = 19 → 3 张，
+        最后一张只有 1 张码）验证一遍。
+        """
+        frames, _raw = _make_frames(38_000)
+        frames = frames[:17]
+        imgs = list(qr.anim_images(frames, "M", 480, markers=True, matrix=3))
+        n = len(frames) + 2
+        self.assertEqual(len(imgs), -(-n // 9))
+        got = set()
+        for im in imgs:
+            got |= set(qr._read_one(im.convert("RGB"), fast=True))
+        data = {t for t in got if not qr.is_marker(t)}
+        self.assertEqual(data, set(frames), "最后一宫格漏了：缺 %d 帧"
+                         % len(set(frames) - data))
+
+    def test_matrix_decodes_every_tile(self):
+        """一张 3×3 大图要一次解出 9 张码，不能只认第一块。"""
+        imgs = list(qr.anim_images(self.frames, "M", 480, markers=True, matrix=3))
+        got = qr._read_one(imgs[0].convert("RGB"), fast=True)
+        self.assertEqual(len(got), 9, "3×3 只解出 %d 张" % len(got))
+
+    def test_matrix_roundtrip_covers_all_frames(self):
+        """拼图动图整份还原：一帧都不能少、不能多。"""
+        imgs = list(qr.anim_images(self.frames, "M", 480, markers=True, matrix=3))
+        texts = []
+        for im in imgs:
+            texts.extend(qr._read_one(im.convert("RGB"), fast=True))
+        texts = qr._dedup(texts)
+        data = [t for t in texts if not qr.is_marker(t)]
+        self.assertEqual(len(data), len(self.frames), "还回来的帧数不对")
+        self.assertEqual(set(data), set(self.frames), "还回来的内容是错的")
+
+
+class ResumeIdleTest(unittest.TestCase):
+    """补录（再来一轮）的判死时长：要够播一整轮，不能沿用 3 秒。"""
+
+    def test_resume_waits_one_loop(self):
+        # 3823 帧、设定 10 帧/秒 → 一轮 382 秒，最多等到 240 秒（不至于空等半小时）
+        self.assertEqual(qr._resume_idle(3823, 10, 3.0), 240.0)
+        # 小文件（120 帧 / 10 帧每秒 = 12 秒一轮）→ 12 + 10 = 22 秒
+        self.assertAlmostEqual(qr._resume_idle(120, 10, 3.0), 22.0, places=3)
+        # 播放比设定慢也一样按轮算
+        self.assertAlmostEqual(qr._resume_idle(120, 3, 3.0), 50.0, places=3)
+        # 不知道总帧数就退回原来的 idle
+        self.assertEqual(qr._resume_idle(None, 10, 3.0), 3.0)
+        # 永远不小于默认 idle（一帧也要给 10 秒：等首帧标识哪能 3 秒就判死）
+        self.assertAlmostEqual(qr._resume_idle(1, 10, 3.0), 10.1, places=3)
+
+    def test_first_round_still_uses_idle(self):
+        """第一轮（没有已知帧）必须保持原来的 3 秒语义，别把「框错地方」拖成几分钟。"""
+        self.assertEqual(qr._resume_idle(None, 10, qr.SCAN_IDLE), qr.SCAN_IDLE)
 
 
 if __name__ == "__main__":

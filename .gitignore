@@ -17,7 +17,10 @@ build_verify*/
 samples/
 
 # ---- 释放物 / 临时 ----
-release/
+# 二进制制品（zip / exe）不进仓库，走 GitHub Release 附件；
+# 但各版本的发布说明要留档，所以只忽略 release/ 下的其他内容。
+release/*
+!release/RELEASE_NOTES*.md
 *.opk.txt
 *.opk.part*.txt
 *.part*.txt

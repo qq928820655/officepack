@@ -77,10 +77,14 @@ class ProgressTest(unittest.TestCase):
         qr.render_images(self.frames, self.tmp, "p", ec="L", sheet=False,
                          progress=lambda d, t, s: seen.append((d, t, s)))
         self.assertTrue(seen, "一条进度都没报")
-        self.assertEqual(seen[-1][0], len(self.frames))
-        self.assertEqual(seen[-1][1], len(self.frames))
-        self.assertTrue(all(t == len(self.frames) for _d, t, _s in seen))
-        self.assertEqual([d for d, _t, _s in seen], list(range(1, len(self.frames) + 1)))
+        # 预排（zxing 先把每帧编码一遍量模块数）也要报进度：3800 帧的大文件
+        # 在这一步要跑一分钟，不报的话界面就是死的。两个阶段各自 0→100%。
+        self.assertEqual([s for _d, _t, s in seen if s == "排版"],
+                         ["排版"] * len(self.frames))
+        render = [(d, t) for d, t, s in seen if s == "渲染"]
+        self.assertEqual(render[-1], (len(self.frames), len(self.frames)))
+        self.assertTrue(all(t == len(self.frames) for _d, t in render))
+        self.assertEqual([d for d, _t in render], list(range(1, len(self.frames) + 1)))
 
     def test_render_gif_reports_marker_frames_too(self):
         seen = []
